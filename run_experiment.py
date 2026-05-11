@@ -1,6 +1,21 @@
 """
-Main Experiment Runner
-Orchestrates the entire experimental pipeline
+Main Experiment Runner (V4 — reordered pipeline)
+
+Orchestrates the entire experimental pipeline.
+
+V4 changes:
+  - Reordered steps: Probing moved from 9→4 (after Error Analysis)
+  - New pipeline order:
+      1. Data Preparation
+      2. Model Inference
+      3. Error Analysis
+      4. Probability Probing (was Step 9)
+      5. CKA Analysis (was Step 4)
+      6. Projection Matrix Training (was Step 5)
+      7. Injection Experiments (was Step 6)
+      8. Visualization (was Step 7)
+      9. Summary Report (was Step 8)
+  - Updated file mappings and CLI help
 """
 
 import os
@@ -8,114 +23,50 @@ import sys
 import argparse
 import subprocess
 import time
-from typing import List
+from typing import List, Dict
 
 
 def print_banner(message: str):
-    """Print a formatted banner"""
-    print("\n" + "="*80)
+    """Print a formatted banner."""
+    print("\n" + "=" * 80)
     print(message.center(80))
-    print("="*80 + "\n")
+    print("=" * 80 + "\n")
 
 
 def run_command(command: List[str], step_name: str) -> bool:
-    """
-    Run a command and handle errors
-    
-    Returns:
-        True if successful, False otherwise
-    """
+    """Run a subprocess command and handle errors."""
     print_banner(f"Starting: {step_name}")
     print(f"Command: {' '.join(command)}\n")
-    
+
     start_time = time.time()
-    
     try:
         result = subprocess.run(
-            command,
-            check=True,
-            text=True,
-            capture_output=False
+            command, check=True, text=True, capture_output=False,
         )
-        
         elapsed = time.time() - start_time
-        print(f"\n✓ {step_name} completed successfully in {elapsed:.1f}s")
+        print(f"\n  Step completed in {elapsed:.1f}s")
         return True
-        
     except subprocess.CalledProcessError as e:
         elapsed = time.time() - start_time
-        print(f"\n✗ {step_name} failed after {elapsed:.1f}s")
-        print(f"Error: {e}")
+        print(f"\n  Step FAILED after {elapsed:.1f}s: {e}")
         return False
     except KeyboardInterrupt:
-        print(f"\n✗ {step_name} interrupted by user")
+        print(f"\n  Step interrupted by user")
         return False
 
 
-def run_step1_data_prep(use_synthetic: bool = False, num_samples: int = 200):
-    """Step 1: Prepare data"""
-    cmd = [sys.executable, "step1_prepare_data.py"]
-    
-    if use_synthetic:
-        cmd.append("--use_synthetic")
-    
-    cmd.extend(["--num_samples", str(num_samples)])
-    
-    return run_command(cmd, "Step 1: Data Preparation")
-
-
-def run_step2_inference(model: str = "all", max_samples: int = None):
-    """Step 2: Run model inference"""
-    cmd = [sys.executable, "step2_run_inference.py", "--model", model]
-    
-    if max_samples:
-        cmd.extend(["--max_samples", str(max_samples)])
-    
-    return run_command(cmd, f"Step 2: Model Inference ({model})")
-
-
-def run_step3_error_analysis():
-    """Step 3: Analyze errors"""
-    cmd = [sys.executable, "step3_error_analysis.py"]
-    return run_command(cmd, "Step 3: Error Analysis")
-
-
-def run_step4_cka_analysis(num_samples: int = 200):
-    """Step 4: CKA analysis"""
-    cmd = [sys.executable, "step4_cka_analysis.py", "--num_samples", str(num_samples)]
-    return run_command(cmd, "Step 4: CKA Analysis")
-
-
-def run_step5_projection(try_multiple_layers: bool = True):
-    """Step 5: Train projection matrix"""
-    cmd = [sys.executable, "step5_train_projection.py"]
-    
-    if try_multiple_layers:
-        cmd.append("--try_multiple_layers")
-    
-    return run_command(cmd, "Step 5: Projection Matrix Training")
-
-
-def run_step6_injection(max_samples: int = 50):
-    """Step 6: Injection experiments"""
-    cmd = [sys.executable, "step6_injection_experiment.py", "--max_samples", str(max_samples)]
-    return run_command(cmd, "Step 6: Injection Experiments")
-
-
-def run_step7_visualization(num_cases: int = 10, skip_individual: bool = False):
-    """Step 7: Create visualizations"""
-    cmd = [sys.executable, "step7_visualization.py", "--num_cases", str(num_cases)]
-    
-    if skip_individual:
-        cmd.append("--skip_individual")
-    
-    return run_command(cmd, "Step 7: Visualization")
-
-
-def run_step8_summary():
-    """Step 8: Generate summary report"""
-    cmd = [sys.executable, "step8_summary.py"]
-    return run_command(cmd, "Step 8: Summary Report")
+# Step names for display
+STEP_NAMES = {
+    1: "Data Preparation (HuggingFace QA)",
+    2: "Model Inference",
+    3: "Error Analysis",
+    4: "Probability Probing (3-Model)",
+    5: "CKA Analysis",
+    6: "Projection Matrix Training",
+    7: "Injection Experiments",
+    8: "Visualization",
+    9: "Summary Report",
+}
 
 
 def main():
@@ -124,154 +75,160 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run all steps
   python run_experiment.py --all
-  
-  # Run specific steps
-  python run_experiment.py --steps 1 2 3
-  
-  # Run with synthetic data (for testing)
-  python run_experiment.py --all --use_synthetic --max_samples 10
-  
-  # Run inference only for small model
-  python run_experiment.py --steps 2 --model qwen1.5B
-        """
+  python run_experiment.py --steps 1 2 3 4
+  python run_experiment.py --all --max_samples 10  (for testing)
+  python run_experiment.py --steps 6 7 --small_model qwen1.5B
+  python run_experiment.py --steps 4 --max_probing_samples 20
+  python run_experiment.py --steps 4 --probing_models qwen1.5B qwen7B
+        """,
     )
-    
+
     # Step selection
-    parser.add_argument("--all", action="store_true",
-                      help="Run all steps (1-8)")
-    parser.add_argument("--steps", nargs="+", type=int,
-                      choices=range(1, 9),
-                      help="Specific steps to run (1-8)")
-    
-    # Data preparation options
-    parser.add_argument("--use_synthetic", action="store_true",
-                      help="Use synthetic data (for testing)")
-    parser.add_argument("--num_samples", type=int, default=200,
-                      help="Number of test samples")
-    
-    # Inference options
-    parser.add_argument("--model", type=str, 
-                      choices=["qwen1.5B", "qwen7B", "qwen14B", "all"],
-                      default="all",
-                      help="Which model(s) to run inference for")
-    parser.add_argument("--max_samples", type=int,
-                      help="Maximum samples to process (for testing)")
-    
-    # Projection options
-    parser.add_argument("--no_multiple_layers", action="store_true",
-                      help="Don't try multiple layers for projection")
-    
-    # Injection options
-    parser.add_argument("--max_injection_samples", type=int, default=50,
-                      help="Maximum B-ball samples for injection")
-    
-    # Visualization options
-    parser.add_argument("--num_vis_cases", type=int, default=10,
-                      help="Number of cases to visualize")
-    parser.add_argument("--skip_individual_plots", action="store_true",
-                      help="Skip individual case plots")
-    
-    # Continue on error
-    parser.add_argument("--continue_on_error", action="store_true",
-                      help="Continue even if a step fails")
-    
+    parser.add_argument("--all", action="store_true", help="Run all steps (1-9)")
+    parser.add_argument("--steps", nargs="+", type=int, choices=range(1, 10),
+                        help="Specific steps to run (1-9)")
+
+    # Data preparation
+    parser.add_argument("--total_samples", type=int, default=300)
+
+    # Inference
+    parser.add_argument("--model", type=str,
+                        choices=["qwen1.5B", "qwen3B", "qwen7B", "all"], default="all")
+    parser.add_argument("--max_samples", type=int, default=None)
+
+    # Projection & injection
+    parser.add_argument("--no_multiple_layers", action="store_true")
+    parser.add_argument("--small_model", type=str, default="qwen1.5B",
+                        choices=["qwen1.5B", "qwen3B"])
+    parser.add_argument("--large_model", type=str, default="qwen7B",
+                        choices=["qwen7B"])
+
+    # Injection
+    parser.add_argument("--max_injection_samples", type=int, default=50)
+
+    # Visualization
+    parser.add_argument("--num_vis_cases", type=int, default=10)
+    parser.add_argument("--skip_individual_plots", action="store_true")
+
+    # Probing (Step 4)
+    parser.add_argument("--probing_models", nargs="+", type=str,
+                        choices=["qwen1.5B", "qwen3B", "qwen7B"],
+                        default=["qwen1.5B", "qwen3B", "qwen7B"],
+                        help="Models to probe in Step 4 (default: all 3)")
+    parser.add_argument("--max_probing_samples", type=int, default=None,
+                        help="Max samples for Step 4 probing (default: all error samples)")
+
+    # Control
+    parser.add_argument("--continue_on_error", action="store_true")
     args = parser.parse_args()
-    
-    # Determine which steps to run
+
+    # Determine steps
     if args.all:
-        steps_to_run = list(range(1, 9))
+        steps_to_run = list(range(1, 10))
     elif args.steps:
         steps_to_run = sorted(args.steps)
     else:
         parser.print_help()
         print("\nError: Must specify either --all or --steps")
         sys.exit(1)
-    
+
     print_banner("Heterogeneous Model Alignment Experiment")
-    print(f"Steps to run: {steps_to_run}")
-    print(f"Continue on error: {args.continue_on_error}")
-    
-    # Track results
-    results = {}
+    print(f"  Steps: {steps_to_run}")
+    print(f"  Continue on error: {args.continue_on_error}")
+    print(f"  Small model: {args.small_model}, Large model: {args.large_model}")
+
+    results: Dict[int, bool] = {}
     start_time = time.time()
-    
-    # Run selected steps
+
     for step in steps_to_run:
+        cmd = [sys.executable]
         success = False
-        
+
         if step == 1:
-            success = run_step1_data_prep(
-                use_synthetic=args.use_synthetic,
-                num_samples=args.num_samples
-            )
+            cmd = [sys.executable, "step1_prepare_data.py",
+                   "--total_samples", str(args.total_samples)]
+            success = run_command(cmd, f"Step 1: {STEP_NAMES[1]}")
+
         elif step == 2:
-            success = run_step2_inference(
-                model=args.model,
-                max_samples=args.max_samples
-            )
+            cmd = [sys.executable, "step2_run_inference.py", "--model", args.model]
+            if args.max_samples:
+                cmd.extend(["--max_samples", str(args.max_samples)])
+            success = run_command(cmd, f"Step 2: {STEP_NAMES[2]}")
+
         elif step == 3:
-            success = run_step3_error_analysis()
+            cmd = [sys.executable, "step3_error_analysis.py",
+                   "--num_samples", str(args.total_samples)]
+            success = run_command(cmd, f"Step 3: {STEP_NAMES[3]}")
+
         elif step == 4:
-            success = run_step4_cka_analysis(
-                num_samples=args.num_samples
-            )
+            cmd = [sys.executable, "step4_probability_probing.py",
+                   "--small_model", args.small_model,
+                   "--large_model", args.large_model]
+            # Add probing models (pass all in a single --models flag)
+            cmd.extend(["--models"] + args.probing_models)
+            if args.max_probing_samples:
+                cmd.extend(["--max_samples", str(args.max_probing_samples)])
+            success = run_command(cmd, f"Step 4: {STEP_NAMES[4]}")
+
         elif step == 5:
-            success = run_step5_projection(
-                try_multiple_layers=not args.no_multiple_layers
-            )
+            cmd = [sys.executable, "step5_cka_analysis.py",
+                   "--num_samples", str(args.total_samples)]
+            success = run_command(cmd, f"Step 5: {STEP_NAMES[5]}")
+
         elif step == 6:
-            success = run_step6_injection(
-                max_samples=args.max_injection_samples
-            )
+            cmd = [sys.executable, "step6_train_projection.py",
+                   "--small_model", args.small_model,
+                   "--large_model", args.large_model]
+            if not args.no_multiple_layers:
+                cmd.append("--try_multiple_layers")
+            success = run_command(cmd, f"Step 6: {STEP_NAMES[6]}")
+
         elif step == 7:
-            success = run_step7_visualization(
-                num_cases=args.num_vis_cases,
-                skip_individual=args.skip_individual_plots
-            )
+            cmd = [sys.executable, "step7_injection_experiment.py",
+                   "--max_samples", str(args.max_injection_samples),
+                   "--small_model", args.small_model,
+                   "--large_model", args.large_model]
+            success = run_command(cmd, f"Step 7: {STEP_NAMES[7]}")
+
         elif step == 8:
-            success = run_step8_summary()
-        
+            cmd = [sys.executable, "step8_visualization.py",
+                   "--num_cases", str(args.num_vis_cases)]
+            if args.skip_individual_plots:
+                cmd.append("--skip_individual")
+            success = run_command(cmd, f"Step 8: {STEP_NAMES[8]}")
+
+        elif step == 9:
+            cmd = [sys.executable, "step9_summary.py"]
+            success = run_command(cmd, f"Step 9: {STEP_NAMES[9]}")
+
         results[step] = success
-        
+
         if not success and not args.continue_on_error:
             print_banner("Experiment Terminated Due to Error")
             break
-    
-    # Print final summary
+
+    # Final summary
     total_time = time.time() - start_time
-    
     print_banner("Experiment Complete")
-    print("Results Summary:")
+
+    print(f"{'Step':<6} {'Name':<45} {'Status'}")
     print("-" * 80)
-    
     for step, success in results.items():
-        status = "✓ SUCCESS" if success else "✗ FAILED"
-        step_names = {
-            1: "Data Preparation",
-            2: "Model Inference",
-            3: "Error Analysis",
-            4: "CKA Analysis",
-            5: "Projection Training",
-            6: "Injection Experiments",
-            7: "Visualization",
-            8: "Summary Report"
-        }
-        print(f"Step {step} ({step_names[step]}): {status}")
-    
+        status = "OK" if success else "FAILED"
+        print(f"  {step:<4} {STEP_NAMES[step]:<45} {status}")
+
     print("-" * 80)
-    print(f"Total time: {total_time/60:.1f} minutes")
-    
-    # Overall status
+    print(f"Total time: {total_time / 60:.1f} minutes")
+
     all_success = all(results.values())
     if all_success:
-        print("\n✓ All steps completed successfully!")
-        print("\nView results at:")
-        print("  - experiment_results/summary_report.json")
-        print("  - experiment_results/analysis/")
+        print("\nAll steps completed successfully!")
+        print("  Results: experiment_results/summary_report.json")
+        print("  Analysis: experiment_results/analysis/")
+        print("  Probing: experiment_results/probing/")
     else:
-        print("\n✗ Some steps failed. Check logs above for details.")
+        print("\nSome steps failed. Check logs above.")
         sys.exit(1)
 
 

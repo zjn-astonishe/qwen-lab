@@ -63,7 +63,7 @@ python step2_run_inference.py --model qwen1.5B
 ```
 
 选项：
-- `--model`: 选择模型 (qwen1.5B/qwen7B/qwen14B/all)
+- `--model`: 选择模型 (qwen1.5B/qwen7B/qwen3B/all)
 - `--max_samples`: 限制处理的样本数量（用于测试）
 
 #### 步骤 3: 错误分析
@@ -145,8 +145,8 @@ exp/
     │
     ├── model_outputs/               # 模型输出
     │   ├── qwen1.5B/
-    │   ├── qwen7B/
-    │   └── qwen14B/
+    │   ├── qwen3B/
+    │   └── qwen7B/
     │
     ├── analysis/                    # 分析结果
     │   ├── error_analysis.csv
