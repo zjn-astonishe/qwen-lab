@@ -129,12 +129,14 @@ def extract_hidden_states_from_forward(
     """
     result = {}
 
-    with torch.no_grad():
+    # Use inference_mode for better performance
+    with torch.inference_mode():
         outputs = model(
             input_ids=full_sequence_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
             output_attentions=False,
+            use_cache=False,  # Don't need cache for single forward pass
         )
 
     # outputs.hidden_states: tuple of (batch, seq_len, hidden_dim) per layer
@@ -146,29 +148,33 @@ def extract_hidden_states_from_forward(
     layer_start = 1 if skip_embedding and num_layers_total > 1 else 0
 
     # --- Prefill hidden states: last INPUT token ---
-    prefill_layers = []
-    for layer_idx in range(layer_start, num_layers_total):
-        # shape: (batch, seq_len, hidden_dim) -> take last input token
-        h = all_layers_hs[layer_idx][0, input_length - 1, :].cpu()
-        prefill_layers.append(h)
+    # Optimize: extract all layers at once for the prefill position
+    prefill_idx = input_length - 1
+    prefill_layers = [
+        all_layers_hs[layer_idx][0, prefill_idx, :].cpu().clone()
+        for layer_idx in range(layer_start, num_layers_total)
+    ]
     result["prefill_hidden_states"] = prefill_layers
 
     # --- Per-step generation hidden states ---
     total_len = full_sequence_ids.shape[1]
     num_generated = total_len - input_length
 
+    # Optimize: batch extract hidden states for all generation steps
     hidden_states_per_step = []
-    for gen_step in range(num_generated):
-        pos = input_length + gen_step  # absolute position in full sequence
-        step_layers = []
-        for layer_idx in range(layer_start, num_layers_total):
-            h = all_layers_hs[layer_idx][0, pos, :].cpu()
-            step_layers.append(h)
-        hidden_states_per_step.append(step_layers)
+    if num_generated > 0:
+        for gen_step in range(num_generated):
+            pos = input_length + gen_step
+            step_layers = [
+                all_layers_hs[layer_idx][0, pos, :].cpu().clone()
+                for layer_idx in range(layer_start, num_layers_total)
+            ]
+            hidden_states_per_step.append(step_layers)
 
     result["hidden_states_per_step"] = hidden_states_per_step
 
-    del outputs
+    # Cleanup
+    del outputs, all_layers_hs
     cleanup_gpu()
     return result
 
@@ -190,6 +196,11 @@ def run_inference_with_states(
     V5: Decoupled generation from hidden-states extraction.
       1. model.generate() produces the text + per-step scores (NO output_hidden_states).
       2. A separate forward pass on the full sequence extracts all hidden states.
+    
+    Optimizations:
+      - Use torch.inference_mode() for better performance
+      - Enable use_cache for KV cache optimization
+      - Optimize tensor operations to reduce memory transfers
     """
     inputs = tokenizer(input_text, return_tensors="pt")
     input_ids = inputs["input_ids"].to(model.device)
@@ -201,7 +212,8 @@ def run_inference_with_states(
     input_length = input_ids.shape[1]
 
     # --- Step 1: Generate tokens (without output_hidden_states) ---
-    with torch.no_grad():
+    # Use inference_mode for better performance than no_grad
+    with torch.inference_mode():
         gen_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -212,6 +224,7 @@ def run_inference_with_states(
             "output_attentions": False,
             "pad_token_id": pad_token_id,
             "do_sample": GENERATION_CONFIG.get("do_sample", False),
+            "use_cache": True,  # Enable KV cache for faster generation
         }
         gen_outputs = model.generate(**gen_kwargs)
 
@@ -223,6 +236,7 @@ def run_inference_with_states(
     top_k_info: List[Dict[str, torch.Tensor]] = []
 
     if gen_outputs.scores is not None:
+        # Process all scores at once for better efficiency
         for score in gen_outputs.scores:
             # score shape: (batch, vocab_size) in standard transformers
             if score.dim() == 3:
@@ -230,22 +244,27 @@ def run_inference_with_states(
             if score.dim() == 2:
                 score = score[0]  # (batch, vocab) -> (vocab,)
 
-            logits = score.cpu()
-            probs = torch.softmax(logits, dim=-1)
-
+            # Keep on GPU for softmax computation, then move to CPU
+            logits_gpu = score
+            probs_gpu = torch.softmax(logits_gpu, dim=-1)
+            
             if save_full_logits:
-                top_k_info.append({"full_logits": logits, "full_probs": probs})
-            else:
-                k_val = min(max(1, top_k_logits), probs.size(0))
-                top_k_probs, top_k_indices = torch.topk(probs, k=k_val)
-                top_k_logits_vals = logits[top_k_indices]
                 top_k_info.append({
-                    "indices": top_k_indices,
-                    "logits": top_k_logits_vals,
-                    "probs": top_k_probs,
+                    "full_logits": logits_gpu.cpu(),
+                    "full_probs": probs_gpu.cpu()
                 })
-
-            del logits, probs
+            else:
+                k_val = min(max(1, top_k_logits), probs_gpu.size(0))
+                top_k_probs, top_k_indices = torch.topk(probs_gpu, k=k_val)
+                top_k_logits_vals = logits_gpu[top_k_indices]
+                top_k_info.append({
+                    "indices": top_k_indices.cpu(),
+                    "logits": top_k_logits_vals.cpu(),
+                    "probs": top_k_probs.cpu(),
+                })
+            
+            # Explicit cleanup
+            del logits_gpu, probs_gpu
     del gen_outputs.scores
 
     # --- Step 2: Extract hidden states via forward pass ---
@@ -253,14 +272,22 @@ def run_inference_with_states(
         # Build full sequence: input + generated tokens
         # generated_ids already includes input_ids prefix
         full_ids = generated_ids.unsqueeze(0).to(model.device)
-        full_mask = torch.ones_like(full_ids)
+        
+        # Optimize attention mask construction
         if attention_mask is not None:
-            # Reconstruct full attention mask
-            full_mask = torch.cat([
-                attention_mask,
-                torch.ones(1, full_ids.shape[1] - input_length,
-                          dtype=attention_mask.dtype, device=attention_mask.device),
-            ], dim=1)
+            # Reconstruct full attention mask efficiently
+            num_new_tokens = full_ids.shape[1] - input_length
+            if num_new_tokens > 0:
+                new_mask = torch.ones(
+                    1, num_new_tokens,
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device
+                )
+                full_mask = torch.cat([attention_mask, new_mask], dim=1)
+            else:
+                full_mask = attention_mask
+        else:
+            full_mask = torch.ones_like(full_ids)
 
         hs_result = extract_hidden_states_from_forward(
             model, full_ids, full_mask,

@@ -105,15 +105,17 @@ def collect_hidden_state_pairs(
         if small_hs is None or large_hs is None:
             continue
 
+        # Hidden states from step2 are already 1D vectors (hidden_dim,)
+        # No need to average over token dimension
         if isinstance(small_hs, torch.Tensor):
-            X_list.append(small_hs.float().mean(dim=0))  # pool token dim → (dim_small,)
+            X_list.append(small_hs.float())
         else:
-            X_list.append(torch.tensor(np.array(small_hs), dtype=torch.float32).mean(dim=0))
+            X_list.append(torch.tensor(np.array(small_hs), dtype=torch.float32))
 
         if isinstance(large_hs, torch.Tensor):
-            Y_list.append(large_hs.float().mean(dim=0))  # pool token dim → (dim_large,)
+            Y_list.append(large_hs.float())
         else:
-            Y_list.append(torch.tensor(np.array(large_hs), dtype=torch.float32).mean(dim=0))
+            Y_list.append(torch.tensor(np.array(large_hs), dtype=torch.float32))
 
     if not X_list or not Y_list:
         print("  Error: no valid hidden state pairs collected!")

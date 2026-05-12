@@ -164,7 +164,7 @@ PROBING_CONFIG = {
 
 HARDWARE_CONFIG = {
     "device": "cuda",
-    "dtype": "float16",
+    "dtype": "bfloat16",
     "max_memory": {0: "78GB"},
 }
 
