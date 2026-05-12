@@ -4,15 +4,59 @@
 
 ## 📊 生成的可视化图表
 
-### 1. CKA相似度热力图 (CKA Similarity Heatmaps)
+### 1. 概率探测可视化 (Probability Probing)
+
+**位置**: `experiment_results/probing/probing_*.png`
+
+Step 4 生成的概率探测可视化，包含5种图表：
+
+#### (1) 聚合P(GT)曲线 (`probing_aggregate.png`)
+- **左图**: 三个模型的平均P(GT)随层级进展的变化
+- **中图**: GT token排名的演化
+- **右图**: P(GT)/P(pred)比率变化
+
+**解读**：
+- 显示模型在哪个层开始"锁定"正确答案
+- 可识别小模型在何处失去对GT token的追踪
+
+#### (2) 个体样本演化 (`probing_individual.png`)
+- 12个子图展示单个样本的层级概率演化
+- 实线：P(GT)，虚线：P(pred)
+- 不同颜色代表不同模型（1.5B/3B/7B）
+
+#### (3) 分歧点分析 (`probing_divergence.png`)
+- **左图**: 模型对之间的分歧点分布直方图
+- **右图**: 最优切换点分析（何时从小模型切换到大模型）
+
+**应用**：
+- 指导级联推理架构设计
+- 确定早期退出的最佳时机
+
+#### (4) 熵演化对比 (`probing_entropy.png`)
+- **左图**: 三个模型的熵随层级的变化
+- **右图**: 模型间的熵差异
+
+**解读**：
+- 熵越低表示模型越"自信"
+- 可识别模型何时开始"犹豫不决"
+
+#### (5) 早期退出决策矩阵 (`probing_early_exit.png`)
+- **左图**: 不同模型在各层的平均P(GT)热力图
+- **右图**: 达到P(GT)阈值所需的样本比例
+
+**应用**：
+- 量化"需要多少层才能获得足够信心"
+- 优化推理效率
+
+### 2. CKA相似度热力图 (CKA Similarity Heatmaps)
 
 **位置**: `experiment_results/analysis/cka_matrix_*.png`
 
 生成3个热力图，展示不同模型对之间的层级相似度：
 
-- `cka_matrix_1.5Bvs7B.png` - 1.5B模型 vs 7B模型
-- `cka_matrix_7Bvs14B.png` - 7B模型 vs 14B模型  
-- `cka_matrix_1.5Bvs14B.png` - 1.5B模型 vs 14B模型
+- `cka_matrix_1.5B_vs_7B.png` - 1.5B模型 vs 7B模型
+- `cka_matrix_7B_vs_3B.png` - 7B模型 vs 3B模型  
+- `cka_matrix_1.5B_vs_3B.png` - 1.5B模型 vs 3B模型
 
 **解读**：
 - 颜色越红，CKA相似度越高（0-1范围）
@@ -25,7 +69,7 @@
 说明这两层学习到了类似的特征表示，可以作为投影注入的候选层。
 ```
 
-### 2. CKA相似度曲线 (CKA Similarity Curves)
+### 3. CKA相似度曲线 (CKA Similarity Curves)
 
 **位置**: `experiment_results/analysis/cka_curves.png`
 
@@ -37,7 +81,7 @@
 - 显示模型间层级对齐的变化趋势
 - 峰值位置表示最相似的层对
 
-### 3. 概率分布对比图 (Probability Distribution Comparison)
+### 4. 概率分布对比图 (Probability Distribution Comparison)
 
 **位置**: `experiment_results/analysis/prob_dist_plots/case_XXX_comparison.png`
 
@@ -58,7 +102,7 @@
 - 则说明小模型存在"B球困境"（难以区分相似选项）
 ```
 
-### 4. 实验综合总结图 (Experiment Summary)
+### 5. 实验综合总结图 (Experiment Summary)
 
 **位置**: `experiment_results/analysis/experiment_summary.png`
 
@@ -82,7 +126,7 @@
 - 直方图对比B球困境和其他错误的数量
 - 量化"类别内混淆"现象的普遍性
 
-### 5. 注入前后对比图 (Injection Effect)
+### 6. 注入前后对比图 (Injection Effect)
 
 **位置**: `experiment_results/analysis/prob_dist_plots/injection_*.png`
 
@@ -128,36 +172,44 @@
 ## 📈 生成可视化的命令
 
 ```bash
-# 生成所有可视化
-python step7_visualization.py
+# 步骤4: 生成概率探测可视化（自动生成）
+python step4_probability_probing.py --max_samples 200
+
+# 步骤8: 生成分布对比和注入效果可视化
+python step8_visualization.py
 
 # 只生成汇总图（跳过单个案例）
-python step7_visualization.py --skip_individual
+python step8_visualization.py --skip_individual
 
 # 指定可视化案例数量
-python step7_visualization.py --num_cases 20
+python step8_visualization.py --num_cases 20
 ```
 
 ## 🔍 深度分析建议
 
-1. **CKA分析**：
+1. **概率探测分析**：
+   - 观察P(GT)曲线的"拐点"，识别模型决策关键层
+   - 分析分歧点分布，了解何时小/大模型开始产生不同预测
+   - 利用早期退出矩阵优化推理效率
+
+2. **CKA分析**：
    - 观察对角线趋势，了解层级对应关系
    - 寻找非对角线高值，发现跨层相似性
    - 对比不同模型对，验证缩放一致性
 
-2. **概率分布分析**：
+3. **概率分布分析**：
    - 计算熵值，量化不确定性
    - 比较top-k重叠度
    - 识别系统性偏差模式
 
-3. **注入效果分析**：
+4. **注入效果分析**：
    - 观察α-性能曲线的单调性
    - 识别最佳注入层的规律
    - 分析失败案例的共同特征
 
 ## 💡 进阶可视化
 
-如需自定义可视化，可修改 `step7_visualization.py` 或使用以下代码片段：
+如需自定义可视化，可修改 `step8_visualization.py` 或使用以下代码片段：
 
 ```python
 # 加载数据
@@ -186,14 +238,27 @@ plt.savefig("custom_plot.png", dpi=300)
 所有可视化的底层数据均可导出：
 
 ```python
+# 概率探测结果
+import json
+import pandas as pd
+
+# JSON格式 - 完整详细数据
+with open("experiment_results/probing/probing_results.json") as f:
+    probing_data = json.load(f)
+print(f"Samples: {len(probing_data)}")
+
+# CSV格式 - 扁平化per-layer数据
+df_probe = pd.read_csv("experiment_results/probing/probing_per_layer.csv")
+print(df_probe.head())
+print(df_probe.groupby('model')['gt_prob'].describe())
+
 # CKA矩阵
 import numpy as np
-cka_matrix = np.load("experiment_results/analysis/cka_matrix_1.5Bvs7B.npy")
+cka_matrix = np.load("experiment_results/analysis/cka_matrix_1.5B_vs_7B.npy")
 print(f"Shape: {cka_matrix.shape}")
 print(f"Mean CKA: {cka_matrix.mean():.4f}")
 
 # 错误分析
-import pandas as pd
 df = pd.read_csv("experiment_results/analysis/error_analysis.csv")
 print(df.describe())
 
@@ -205,13 +270,17 @@ print(best_configs.sort_values().head())
 
 ## 🎯 结果解读检查清单
 
+- [ ] 概率探测图显示清晰的P(GT)演化趋势
+- [ ] 分歧点分析揭示模型行为差异
 - [ ] CKA热力图显示合理的层级对应关系
 - [ ] 概率分布图清晰展示模型差异
 - [ ] B球困境案例占比在合理范围（通常10-30%）
 - [ ] 注入实验显示GT排名有提升
 - [ ] 最佳α值在0.1-0.5之间（通常）
-- [ ] 可视化文件全部正常生成
+- [ ] 所有可视化文件正常生成
 
 ---
 
-**注意**：所有可视化图表会在运行 `step7_visualization.py` 或完整流程 `run_experiment.py --all` 后自动生成。
+**注意**：
+- 概率探测可视化在运行 `step4_probability_probing.py` 时自动生成
+- 其他可视化图表在运行 `step8_visualization.py` 或完整流程 `run_experiment.py --all` 后自动生成

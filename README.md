@@ -73,20 +73,37 @@ python step3_error_analysis.py
 
 分析小模型的错误类型，识别"B球困境"案例。
 
-#### 步骤 4: CKA 相似度分析
+#### 步骤 4: 概率探测分析
 ```bash
-python step4_cka_analysis.py --num_samples 200
+python step4_probability_probing.py --num_samples 200
+```
+
+对错误样本进行逐层概率探测，分析三个模型（1.5B/3B/7B）在每一层的概率分布演化。
+
+选项：
+- `--small_model`: 小模型选择（默认：qwen1.5B）
+- `--large_model`: 大模型选择（默认：qwen7B）
+- `--models`: 要探测的模型列表（默认：所有三个模型）
+- `--max_samples`: 限制探测样本数量
+
+#### 步骤 5: CKA 相似度分析
+```bash
+python step5_cka_analysis.py --num_samples 200
 ```
 
 计算不同模型层间的 Centered Kernel Alignment (CKA) 相似度。
 
-#### 步骤 5: 训练投影矩阵
+选项：
+- `--num_samples`: 用于计算的样本数量
+- `--step_idx`: 生成步骤索引（默认：0）
+
+#### 步骤 6: 训练投影矩阵
 ```bash
 # 尝试多层并选择最佳
-python step5_train_projection.py --try_multiple_layers
+python step6_train_projection.py --try_multiple_layers
 
 # 或指定单层训练
-python step5_train_projection.py --layer_idx -2
+python step6_train_projection.py --layer_idx -2
 ```
 
 选项：
@@ -94,23 +111,34 @@ python step5_train_projection.py --layer_idx -2
 - `--num_samples`: 用于训练的样本数量
 - `--alpha`: Ridge 正则化参数
 
-#### 步骤 6: 状态注入实验
+#### 步骤 7: 状态注入实验
 ```bash
-python step6_injection_experiment.py --max_samples 50
+python step7_injection_experiment.py --max_samples 50
 ```
 
 在"B球困境"样本上执行隐藏状态注入实验。
 
-#### 步骤 7: 可视化
+选项：
+- `--max_samples`: 限制实验样本数量
+- `--small_model`: 小模型选择
+- `--large_model`: 大模型选择
+
+#### 步骤 8: 可视化
 ```bash
-python step7_visualization.py --num_cases 10
+python step8_visualization.py --num_cases 10
 ```
 
 生成概率分布对比图和注入效果可视化。
 
-#### 步骤 8: 生成总结报告
+选项：
+- `--num_cases`: 可视化案例数量
+- `--skip_individual`: 跳过单个案例图表
+- `--small_model`: 小模型选择
+- `--large_model`: 大模型选择
+
+#### 步骤 9: 生成总结报告
 ```bash
-python step8_summary.py
+python step9_summary.py
 ```
 
 汇总所有实验结果并生成综合报告。
@@ -127,11 +155,12 @@ exp/
 ├── step1_prepare_data.py             # 步骤1: 数据准备
 ├── step2_run_inference.py            # 步骤2: 模型推理
 ├── step3_error_analysis.py           # 步骤3: 错误分析
-├── step4_cka_analysis.py             # 步骤4: CKA分析
-├── step5_train_projection.py         # 步骤5: 训练投影矩阵
-├── step6_injection_experiment.py     # 步骤6: 注入实验
-├── step7_visualization.py            # 步骤7: 可视化
-├── step8_summary.py                  # 步骤8: 总结报告
+├── step4_probability_probing.py      # 步骤4: 概率探测分析
+├── step5_cka_analysis.py             # 步骤5: CKA分析
+├── step6_train_projection.py         # 步骤6: 训练投影矩阵
+├── step7_injection_experiment.py     # 步骤7: 注入实验
+├── step8_visualization.py            # 步骤8: 可视化
+├── step9_summary.py                  # 步骤9: 总结报告
 │
 ├── data/                             # 数据目录
 │   └── bfcl_v3/                     # BFCL V3 数据集
@@ -153,6 +182,11 @@ exp/
     │   ├── cka_matrix_*.npy
     │   ├── injection_results.csv
     │   └── prob_dist_plots/
+    │
+    ├── probing/                     # 概率探测结果
+    │   ├── probing_results.json
+    │   ├── probing_per_layer.csv
+    │   └── probing_*.png
     │
     ├── projection_matrices/         # 投影矩阵
     │   ├── W_up_1.5B_to_7B.pt
@@ -203,7 +237,7 @@ exp/
 4. **实验综合总结图** - 4宫格展示错误类型、注入效果等
 5. **注入前后对比图** - 状态注入对概率分布的影响
 
-详细说明请参考：**[VISUALIZATION_GUIDE.md](VISUALIZATION_GUIDE.md)** 📈
+详细说明请参考：**[docs/VISUALIZATION_GUIDE.md](docs/VISUALIZATION_GUIDE.md)** 📈
 
 ## 常见问题
 
