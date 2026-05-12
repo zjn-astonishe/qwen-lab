@@ -1,21 +1,24 @@
 """
-Main Experiment Runner (V4 — reordered pipeline)
+Main Experiment Runner (V6 — renumbered pipeline, Decisive Token as Step 6)
 
 Orchestrates the entire experimental pipeline.
 
-V4 changes:
-  - Reordered steps: Probing moved from 9→4 (after Error Analysis)
-  - New pipeline order:
-      1. Data Preparation
-      2. Model Inference
-      3. Error Analysis
-      4. Probability Probing (was Step 9)
-      5. CKA Analysis (was Step 4)
-      6. Projection Matrix Training (was Step 5)
-      7. Injection Experiments (was Step 6)
-      8. Visualization (was Step 7)
-      9. Summary Report (was Step 8)
-  - Updated file mappings and CLI help
+V6 changes:
+  - Decisive Token Analysis moved from Step 10 to Step 6 (analysis group)
+  - Renumbered: Projection 6→7, Injection 7→8, Visualization 8→9, Summary 9→10
+  - Pipeline order:
+      1.  Data Preparation
+      2.  Model Inference
+      3.  Error Analysis
+      4.  Probability Probing (3-Model)
+      5.  CKA Analysis
+      6.  Decisive Token Analysis
+      7.  Projection Matrix Training
+      8.  Injection Experiments
+      9.  Visualization
+      10. Summary Report
+  - Summary is the final step (logical conclusion)
+  - Steps 3-6: analysis group; Steps 7-8: intervention group; Steps 9-10: output group
 """
 
 import os
@@ -57,15 +60,16 @@ def run_command(command: List[str], step_name: str) -> bool:
 
 # Step names for display
 STEP_NAMES = {
-    1: "Data Preparation (HuggingFace QA)",
-    2: "Model Inference",
-    3: "Error Analysis",
-    4: "Probability Probing (3-Model)",
-    5: "CKA Analysis",
-    6: "Projection Matrix Training",
-    7: "Injection Experiments",
-    8: "Visualization",
-    9: "Summary Report",
+    1:  "Data Preparation (HuggingFace QA)",
+    2:  "Model Inference",
+    3:  "Error Analysis",
+    4:  "Probability Probing (3-Model)",
+    5:  "CKA Analysis",
+    6:  "Decisive Token Analysis",
+    7:  "Projection Matrix Training",
+    8:  "Injection Experiments",
+    9:  "Visualization",
+    10: "Summary Report",
 }
 
 
@@ -78,16 +82,18 @@ Examples:
   python run_experiment.py --all
   python run_experiment.py --steps 1 2 3 4
   python run_experiment.py --all --max_samples 10  (for testing)
-  python run_experiment.py --steps 6 7 --small_model qwen1.5B
+  python run_experiment.py --steps 7 8 --small_model qwen1.5B
   python run_experiment.py --steps 4 --max_probing_samples 20
   python run_experiment.py --steps 4 --probing_models qwen1.5B qwen7B
+  python run_experiment.py --steps 6 --decisive_model qwen7B
+  python run_experiment.py --steps 6 --decisive_model qwen3B --entropy_threshold 3.0
         """,
     )
 
     # Step selection
-    parser.add_argument("--all", action="store_true", help="Run all steps (1-9)")
-    parser.add_argument("--steps", nargs="+", type=int, choices=range(1, 10),
-                        help="Specific steps to run (1-9)")
+    parser.add_argument("--all", action="store_true", help="Run all steps (1-10)")
+    parser.add_argument("--steps", nargs="+", type=int, choices=range(1, 11),
+                        help="Specific steps to run (1-10)")
 
     # Data preparation
     parser.add_argument("--total_samples", type=int, default=300)
@@ -119,13 +125,23 @@ Examples:
     parser.add_argument("--max_probing_samples", type=int, default=None,
                         help="Max samples for Step 4 probing (default: all error samples)")
 
+    # Decisive Token Analysis (Step 6)
+    parser.add_argument("--decisive_model", type=str, default="qwen7B",
+                        choices=["qwen1.5B", "qwen3B", "qwen7B"],
+                        help="Model to analyze in Step 6 (default: qwen7B)")
+    parser.add_argument("--entropy_threshold", type=float, default=2.0,
+                        help="Min output entropy (nats) for Step 6 high-entropy filter "
+                             "(default: 2.0)")
+    parser.add_argument("--decisive_max_display", type=int, default=12,
+                        help="Max samples to display in Step 6 plots/report (default: 12)")
+
     # Control
     parser.add_argument("--continue_on_error", action="store_true")
     args = parser.parse_args()
 
     # Determine steps
     if args.all:
-        steps_to_run = list(range(1, 10))
+        steps_to_run = list(range(1, 11))
     elif args.steps:
         steps_to_run = sorted(args.steps)
     else:
@@ -165,7 +181,6 @@ Examples:
             cmd = [sys.executable, "step4_probability_probing.py",
                    "--small_model", args.small_model,
                    "--large_model", args.large_model]
-            # Add probing models (pass all in a single --models flag)
             cmd.extend(["--models"] + args.probing_models)
             if args.max_probing_samples:
                 cmd.extend(["--max_samples", str(args.max_probing_samples)])
@@ -177,30 +192,39 @@ Examples:
             success = run_command(cmd, f"Step 5: {STEP_NAMES[5]}")
 
         elif step == 6:
-            cmd = [sys.executable, "step6_train_projection.py",
+            cmd = [sys.executable, "step6_decisive_token.py",
+                   "--model", args.decisive_model,
+                   "--entropy_threshold", str(args.entropy_threshold),
+                   "--max_display", str(args.decisive_max_display)]
+            if args.max_samples:
+                cmd.extend(["--num_samples", str(args.max_samples)])
+            success = run_command(cmd, f"Step 6: {STEP_NAMES[6]}")
+
+        elif step == 7:
+            cmd = [sys.executable, "step7_train_projection.py",
                    "--small_model", args.small_model,
                    "--large_model", args.large_model]
             if not args.no_multiple_layers:
                 cmd.append("--try_multiple_layers")
-            success = run_command(cmd, f"Step 6: {STEP_NAMES[6]}")
-
-        elif step == 7:
-            cmd = [sys.executable, "step7_injection_experiment.py",
-                   "--max_samples", str(args.max_injection_samples),
-                   "--small_model", args.small_model,
-                   "--large_model", args.large_model]
             success = run_command(cmd, f"Step 7: {STEP_NAMES[7]}")
 
         elif step == 8:
-            cmd = [sys.executable, "step8_visualization.py",
-                   "--num_cases", str(args.num_vis_cases)]
-            if args.skip_individual_plots:
-                cmd.append("--skip_individual")
+            cmd = [sys.executable, "step8_injection_experiment.py",
+                   "--max_samples", str(args.max_injection_samples),
+                   "--small_model", args.small_model,
+                   "--large_model", args.large_model]
             success = run_command(cmd, f"Step 8: {STEP_NAMES[8]}")
 
         elif step == 9:
-            cmd = [sys.executable, "step9_summary.py"]
+            cmd = [sys.executable, "step9_visualization.py",
+                   "--num_cases", str(args.num_vis_cases)]
+            if args.skip_individual_plots:
+                cmd.append("--skip_individual")
             success = run_command(cmd, f"Step 9: {STEP_NAMES[9]}")
+
+        elif step == 10:
+            cmd = [sys.executable, "step10_summary.py"]
+            success = run_command(cmd, f"Step 10: {STEP_NAMES[10]}")
 
         results[step] = success
 
