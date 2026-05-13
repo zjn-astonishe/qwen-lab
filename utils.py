@@ -146,13 +146,16 @@ def load_model_output(model_output_dir: str, sample_idx: int,
 
 
 def load_model_outputs(model_key: str, num_samples: int,
-                       sub_dir: str = "") -> List[Optional[Dict[str, Any]]]:
+                       sub_dir: str = "",
+                       map_location: str = "cpu") -> List[Optional[Dict[str, Any]]]:
     """Load all model outputs for a given model.
 
     Args:
         model_key: Key in MODELS config (e.g., "qwen1.5B").
         num_samples: Number of samples to load.
         sub_dir: Optional sub-directory within output_dir.
+        map_location: Device to map tensors to (default: "cpu").
+                    Pass "cuda" to load directly to GPU.
 
     Returns:
         List of output dicts (None for missing/failed samples).
@@ -165,7 +168,7 @@ def load_model_outputs(model_key: str, num_samples: int,
 
     outputs = []
     for i in range(num_samples):
-        outputs.append(load_model_output(base, i))
+        outputs.append(load_model_output(base, i, map_location=map_location))
     return outputs
 
 
