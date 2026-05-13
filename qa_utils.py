@@ -106,6 +106,46 @@ def extract_answer(generated_text: str, answer_type: str) -> Optional[str]:
     return None
 
 
+def get_clean_answer(model_output: Dict) -> Tuple[str, str]:
+    """Extract the model's clean answer from a step2 output dict.
+
+    For multiple-choice questions, ``generated_text`` contains the full
+    prompt (including choice labels A/B/C/D).  Naively searching the full
+    text for a letter can match a choice label instead of the actual answer.
+
+    This function provides a **robust, centralized** answer extraction:
+
+    Priority:
+      1. ``generated_answer_only`` — pure answer text (no prompt), added by
+         step2 V6+.  This is the cleanest source.
+      2. ``extract_answer(generated_text, answer_type)`` — falls back to the
+         regex extractor which internally calls ``_strip_prompt()`` to remove
+         everything before the last ``<|im_start|>assistant`` marker.
+
+    Args:
+        model_output: Dict produced by ``step2_run_inference.py``.
+
+    Returns:
+        (answer_str, answer_type) — answer_str may be "" if extraction fails.
+    """
+    # --- Priority 1: pre-computed clean answer (step2 V6+) ---
+    clean = model_output.get("generated_answer_only", "")
+    if clean:
+        clean = clean.strip()
+        # For multiple-choice, the clean answer is typically just "C" or "C\n"
+        # Strip whitespace/newlines
+        clean = clean.split("\n")[0].strip()
+        if clean:
+            answer_type = get_answer_type(model_output.get("ground_truth", {}))
+            return clean, answer_type
+
+    # --- Priority 2: extract from full text via _strip_prompt() ---
+    generated_text = model_output.get("generated_text", "")
+    answer_type = get_answer_type(model_output.get("ground_truth", {}))
+    answer = extract_answer(generated_text, answer_type)
+    return answer or "", answer_type
+
+
 # ---------------------------------------------------------------------------
 # 2. Ground truth helpers
 # ---------------------------------------------------------------------------

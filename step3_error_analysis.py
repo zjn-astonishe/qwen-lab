@@ -25,7 +25,7 @@ from config import MODELS, ANALYSIS_CONFIG, MEMORY_CONFIG, DATA_CONFIG
 from qa_utils import (
     extract_answer, compare_answers, get_gt_answer, get_answer_type,
     get_answer_token_id, find_answer_step, normalize_numerical_answer,
-    parse_details,
+    parse_details, get_clean_answer,
 )
 from utils import load_model_outputs
 
@@ -177,11 +177,10 @@ def analyze_sample_errors(
         "skip_reason": None,
     }
 
-    # --- Extract and compare answers ---
-    generated_text = small_model_output.get("generated_text", "")
+    # --- Extract and compare answers (use centralized get_clean_answer) ---
     ground_truth = small_model_output.get("ground_truth", {})
     answer_type = get_answer_type(ground_truth)
-    predicted_answer = extract_answer(generated_text, answer_type)
+    predicted_answer, _ = get_clean_answer(small_model_output)
     comparison = compare_answers(predicted_answer, ground_truth)
 
     analysis["has_error"] = comparison["has_error"]
@@ -281,8 +280,8 @@ def compare_three_models(
 
         answers = {}
         for model_name, outputs in [("1.5B", outputs_1_5B), ("3B", outputs_3B), ("7B", outputs_7B)]:
-            text = outputs[i].get("generated_text", "")
-            answers[model_name] = extract_answer(text, answer_type)
+            pred, _ = get_clean_answer(outputs[i])
+            answers[model_name] = pred or None
 
         correct = {}
         for model_name, pred in answers.items():
@@ -447,9 +446,8 @@ def main():
         for i in tqdm(range(args.num_samples), desc=f"{large_key} accuracy", leave=False):
             if large_outputs[i] is None or (i >= len(results)):
                 continue
-            large_text = large_outputs[i].get("generated_text", "")
             large_gt = large_outputs[i].get("ground_truth", {})
-            large_pred = extract_answer(large_text, get_answer_type(large_gt))
+            large_pred, _ = get_clean_answer(large_outputs[i])
             large_cmp = compare_answers(large_pred, large_gt)
 
             if large_cmp["error_subtype"] == "gt_unavailable":

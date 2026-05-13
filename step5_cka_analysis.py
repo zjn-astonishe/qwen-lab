@@ -69,7 +69,7 @@ def load_all_layers_for_model(
         layer_arrays = []
         for layer_hidden in actual_layers:
             if isinstance(layer_hidden, torch.Tensor):
-                layer_arrays.append(layer_hidden.numpy())
+                layer_arrays.append(layer_hidden.float().numpy())
             elif layer_hidden is not None:
                 layer_arrays.append(np.array(layer_hidden))
             else:

@@ -129,9 +129,8 @@ Examples:
     parser.add_argument("--decisive_model", type=str, default="qwen7B",
                         choices=["qwen1.5B", "qwen3B", "qwen7B"],
                         help="Model to analyze in Step 6 (default: qwen7B)")
-    parser.add_argument("--entropy_threshold", type=float, default=2.0,
-                        help="Min output entropy (nats) for Step 6 high-entropy filter "
-                             "(default: 2.0)")
+    parser.add_argument("--entropy_percentile", type=float, default=90,
+                        help="Percentile for entropy filtering in Step 6 (default: 90)")
     parser.add_argument("--decisive_max_display", type=int, default=12,
                         help="Max samples to display in Step 6 plots/report (default: 12)")
 
@@ -194,7 +193,7 @@ Examples:
         elif step == 6:
             cmd = [sys.executable, "step6_decisive_token.py",
                    "--model", args.decisive_model,
-                   "--entropy_threshold", str(args.entropy_threshold),
+                   "--entropy_percentile", str(args.entropy_percentile),
                    "--max_display", str(args.decisive_max_display)]
             if args.max_samples:
                 cmd.extend(["--num_samples", str(args.max_samples)])

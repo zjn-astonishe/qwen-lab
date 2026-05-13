@@ -1,31 +1,28 @@
 """
-Step 6: Decisive Token Analysis (V1)
+Step 6: Decisive Token Analysis (V2)
 
-Identify "decisive tokens" — the input tokens that receive the most attention
-from the model's last layer when the model is uncertain about its answer.
+Identify "decisive tokens" — the PROMPT tokens that receive the most attention
+from the model when producing the FINAL ANSWER token.
 
 Core Question:
-When the final probability distribution has high entropy (multiple candidates
-competing with similar probability), which input tokens did the model's last-layer
-query vectors (Q) attend to the most? These are the "decisive tokens" — the
-information the model relied on to make its uncertain decision.
+When the model generates its final answer, which tokens in the original
+question/prompt did it attend to the most? These are the "decisive tokens" —
+the information the model relied on to make its decision.
 
 Methodology:
-1. Load model + tokenizer (reusing step2's loading pattern for transformers 5.x)
-2. For each sample, run a FORWARD PASS (not generate) with output_attentions=True
-3. Compute Shannon entropy of the output probability distribution
-4. Filter: keep only high-entropy samples (model is uncertain)
-5. Extract last-layer attention at the last input position:
-   - Each attention head h has a Q vector at the last position
-   - Q_h attends to all input positions via softmax(Q_h @ K^T / sqrt(d))
-   - The positions with highest attention are the "decisive tokens" for head h
-6. Per-head decisive tokens → aggregated ranking → "which tokens decide the answer"
-7. Visualizations:
-   (a) Per-sample attention heatmap (heads × input tokens)
-   (b) Decisive token ranking (frequency across all high-entropy samples)
-   (c) Entropy vs attention concentration scatter
-   (d) Head specialization analysis (focused vs diffuse heads)
-   (e) Per-sample text report with decisive tokens highlighted
+1. Load model + tokenizer (eager attention for output_attentions=True)
+2. For each sample, load the full generated sequence (prompt + answer) from step2
+3. Run a FORWARD PASS on the full sequence with output_attentions=True
+4. Extract attention from the LAST MEANINGFUL ANSWER TOKEN position
+   (not the prompt end, not EOS — the actual answer token)
+5. Slice attention to prompt tokens only → "which prompt tokens decided the answer"
+6. Compute entropy at the answer position (model's uncertainty when producing answer)
+7. Filter: keep only high-entropy samples (model is uncertain)
+8. Per-layer decisive tokens → aggregated ranking → visualizations
+
+Key change from V1:
+  V1 analyzed attention from the LAST PROMPT position (predicting 1st generated token)
+  V2 analyzes attention from the ANSWER TOKEN position (final decision point)
 
 Usage:
   python run_experiment.py --steps 10
@@ -113,86 +110,441 @@ def load_model_for_attention(model_key: str):
 # 2. Forward Pass with Attention Capture
 # ============================================================
 
-def forward_pass_with_attention(model, tokenizer, input_text: str, max_length: int = 2048):
-    """Run a forward pass on the input and capture logits + ALL layers' attention.
+# Structured format tokens to skip when finding the answer position.
+# These are tokens that carry formatting/structural meaning (newlines, colons,
+# spaces, thinking tags, chat template tokens) rather than substantive answer
+# content.  We skip them so that entropy is measured at the first *meaningful*
+# answer token, not at a formatting token the model is almost certain about.
+_FORMAT_TOKEN_STRINGS = frozenset({
+    '\n', '\r', '\t', ' ',       # whitespace
+    ':', '：',                    # colons (answer prefix separators)
+    '.', '。', ',', '，',        # punctuation used as formatting
+    ';', '；',                    # semicolons
+})
 
-    This is NOT generation — it's a single forward pass to get:
-    - logits at the last position (prediction for the NEXT token)
-    - attention weights from ALL layers at the last position
+# Substring patterns for multi-token format markers (e.g. <think思考>)
+_FORMAT_TOKEN_PATTERNS = [
+    '<think', '</think',
+    '<|im_start|>', '<|im_end|>',
+    '<|im_start|', '<|im_end|',
+    'assistant',                  # role label inside template
+]
+
+
+def _is_format_token(decoded_str: str) -> bool:
+    """Return True if the decoded token string is a structural format token."""
+    s = decoded_str.strip()
+    if not s:
+        return True  # pure whitespace token
+    if s in _FORMAT_TOKEN_STRINGS:
+        return True
+    for pat in _FORMAT_TOKEN_PATTERNS:
+        if pat in s:
+            return True
+    return False
+
+
+def _find_answer_token_pos(tokenizer, token_ids, gen_start: int, gen_end: int):
+    """Skip structured format tokens and find the first meaningful answer token.
+
+    Starting from ``gen_start``, scans forward through the generated tokens
+    until a non-format token is found.  Also scans backward from ``gen_end``
+    (skipping trailing EOS / format tokens) to find the last meaningful token.
+
+    Strategy: for entropy analysis we typically want the FIRST content token
+    of the answer (the moment the model starts committing to an answer).
+    But if the model uses <think思考> tags, we want to skip past the thinking
+    block and use the first token AFTER </think思考>.
 
     Returns:
-        logits: (vocab_size,) float tensor on CPU (NaN-free)
-        all_layers_attn: (num_layers, num_heads, seq_len) float numpy on CPU
-            attention from the LAST position across all layers
-        input_ids: (seq_len,) int tensor on CPU
+        (first_content_pos, last_content_pos) — absolute positions in token_ids.
+        Falls back to (gen_start, gen_end - 1) if no content token found.
     """
-    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=max_length)
-    input_ids = inputs["input_ids"].to(model.device)
-    attention_mask = inputs.get("attention_mask", None)
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(model.device)
+    total_len = len(token_ids)
+    gen_start = max(gen_start, 0)
+    gen_end = min(gen_end, total_len)
 
-    with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_attentions=True,
+    # --- Find first content token (skip leading format tokens) ---
+    first_pos = gen_start
+    for pos in range(gen_start, gen_end):
+        decoded = tokenizer.decode([token_ids[pos]])
+        if not _is_format_token(decoded):
+            first_pos = pos
+            break
+    else:
+        # All tokens are format tokens — fall back
+        first_pos = gen_start
+
+    # --- Find last content token (skip trailing EOS / format tokens) ---
+    last_pos = max(gen_end - 1, gen_start)
+    for pos in range(gen_end - 1, gen_start - 1, -1):
+        decoded = tokenizer.decode([token_ids[pos]])
+        if not _is_format_token(decoded):
+            last_pos = pos
+            break
+
+    return first_pos, last_pos
+
+
+# ============================================================
+# 2b. Fast entropy from Step2 (skip forward pass)
+# ============================================================
+
+def _fast_entropy_from_step2(step2_output):
+    """Compute entropy from step2's saved generation scores, avoiding a forward pass.
+
+    Because of causal masking, step2's ``scores[0]`` (the logits at the first
+    generation step) is mathematically identical to what step6 would compute
+    via ``logits[input_length - 1]`` in a full forward pass.  We can therefore
+    reuse step2's data directly.
+
+    Priority:
+      1. ``logits_per_step[0]`` — full vocab logits from step2 (exact).
+      2. ``top_k_info[0]``     — top-k probs from step2 (approximate, lower bound).
+
+    Returns:
+        (entropy: float | None, source: str | None)
+        *source* indicates which path was used (for diagnostics).
+    """
+    # --- Path 1: full logits (exact) ---
+    logits_per_step = step2_output.get("logits_per_step")
+    if logits_per_step and len(logits_per_step) > 0:
+        logits = logits_per_step[0].float().clamp(max=80)
+        probs = F.softmax(logits, dim=-1)
+        log_probs = torch.log(probs + 1e-30)
+        entropy = -(probs * log_probs).sum().item()
+        return entropy, "logits_per_step[0] (exact)"
+
+    # --- Path 2: top-k probs (approximate) ---
+    top_k_info = step2_output.get("top_k_info")
+    if top_k_info and len(top_k_info) > 0:
+        info = top_k_info[0]
+        probs = info["probs"].float()
+        k = probs.numel()
+        coverage = probs.sum().item()
+
+        # Shannon entropy from observed top-k
+        log_probs = torch.log(probs + 1e-30)
+        topk_ent = -(probs * log_probs).sum().item()
+
+        # Approximate the tail: assume remaining probability mass is uniform
+        remaining = max(0.0, 1.0 - coverage)
+        V = 151643  # Qwen2.5 vocab size
+        if remaining > 1e-10 and V > k:
+            # H_tail = -R * log(R / (V - k))
+            topk_ent += -remaining * np.log(remaining / (V - k))
+
+        return topk_ent, f"top_k_info[0] (k={k}, coverage={coverage:.4f})"
+
+    return None, None
+
+
+def _extract_fast_entropy_data(step2_output):
+    """Extract minimal data from a step2 output for fast-entropy computation.
+
+    Returns a lightweight dict that _fast_entropy_from_step2 can consume,
+    or None if neither logits_per_step nor top_k_info is available.
+    Tensors are moved to CPU to free GPU memory.
+    """
+    logits_per_step = step2_output.get("logits_per_step")
+    if logits_per_step and len(logits_per_step) > 0:
+        return {"logits_per_step": [logits_per_step[0].cpu()]}
+
+    top_k_info = step2_output.get("top_k_info")
+    if top_k_info and len(top_k_info) > 0:
+        info = top_k_info[0]
+        return {"top_k_info": [{
+            "probs": info["probs"].cpu(),
+        }]}
+
+    return None
+
+
+def _build_prompt_content_mask(tokenizer, prompt_ids):
+    """Build a boolean mask that identifies content (non-format) positions in the prompt.
+
+    Format tokens include:
+      - Chat template special tokens: <|im_start|>, <|im_end|>
+      - Role labels: system, user, assistant
+      - Their immediate neighbors (±1) to capture surrounding \\n / whitespace
+
+    Returns:
+        content_mask: np.ndarray of shape (prompt_len,), True = content position.
+    """
+    import torch as _torch
+    total = len(prompt_ids)
+    is_format = np.zeros(total, dtype=bool)
+
+    # Known Qwen2.5 special token IDs
+    _SPECIAL_TIDS = {151644, 151645}  # <|im_start|>, <|im_end|>
+
+    # Role label strings (exact match after stripping whitespace)
+    _ROLE_LABELS = {'system', 'user', 'assistant'}
+
+    for pos in range(total):
+        tid = prompt_ids[pos].item() if isinstance(prompt_ids[pos], _torch.Tensor) else int(prompt_ids[pos])
+
+        if tid in _SPECIAL_TIDS:
+            is_format[pos] = True
+            continue
+
+        decoded = tokenizer.decode([tid]).strip().lower()
+        if decoded in _ROLE_LABELS:
+            is_format[pos] = True
+
+    # Expand ±1 to also capture surrounding newlines / whitespace
+    expanded = is_format.copy()
+    for pos in range(total):
+        if is_format[pos]:
+            if pos > 0:
+                expanded[pos - 1] = True
+            if pos < total - 1:
+                expanded[pos + 1] = True
+
+    content_mask = ~expanded
+    return content_mask
+
+
+def forward_pass_with_attention(model, tokenizer, input_text: str,
+                                 generated_ids=None, input_length=None,
+                                 max_length: int = 2048,
+                                 extract_per_step: bool = False):
+    """Run a forward pass and capture logits + ALL layers' attention.
+
+    V2 (generated_ids + input_length provided):
+        Forward pass on the FULL sequence (prompt + generated answer).
+        Extracts attention from the ANSWER token position.
+        Returns attention sliced to prompt tokens only.
+
+    V1 (fallback, generated_ids not provided):
+        Forward pass on prompt only, extracts from last prompt position.
+
+    Args:
+        extract_per_step: If True, also extract attention at every generation
+            step (not just the answer position).  This enables per-step
+            attention evolution analysis.  Adds per_step_data to the return dict.
+
+    Returns dict with:
+        logits: (vocab_size,) float tensor on CPU (NaN-free)
+        prompt_attn: (num_layers, num_heads, prompt_len) float numpy
+        input_ids: (seq_len,) int tensor on CPU
+        analyze_pos: int — position where attention was extracted
+        input_length: int — number of prompt tokens
+        total_len: int — total sequence length
+        per_step_data: dict | None — per-step attention/entropy summary
+    """
+    if generated_ids is not None and input_length is not None:
+        # === V2: Full sequence (prompt + generated answer) ===
+        full_ids = generated_ids.unsqueeze(0).to(model.device)  # (1, total_len)
+        total_len = full_ids.shape[1]
+
+        if total_len > max_length:
+            full_ids = full_ids[:, :max_length]
+            total_len = max_length
+            input_length = min(input_length, max_length - 1)
+
+        attention_mask = torch.ones_like(full_ids)
+
+        with torch.no_grad():
+            outputs = model(
+                input_ids=full_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,
+            )
+
+        num_generated = total_len - input_length
+
+        # Skip structured format tokens (newlines, <think思考>, etc.)
+        # to find the actual answer token positions.
+        gen_start = input_length
+        gen_end = total_len
+        first_content_pos, last_content_pos = _find_answer_token_pos(
+            tokenizer, full_ids[0].tolist(), gen_start, gen_end,
+        )
+        skipped_format = first_content_pos - gen_start
+        if skipped_format > 0:
+            # Decode skipped tokens for diagnostics
+            skipped_ids = full_ids[0, gen_start:first_content_pos].tolist()
+            skipped_text = repr(tokenizer.decode(skipped_ids, clean_up_tokenization_spaces=False))
+            if len(skipped_text) > 80:
+                skipped_text = skipped_text[:77] + "..."
+            print(f"    [format-skip] skipped {skipped_format} format tokens: {skipped_text}")
+
+        # analyze_pos: last meaningful content token (for attention extraction)
+        analyze_pos = last_content_pos
+
+        # CRITICAL: logits[pos] predicts the token at pos+1.
+        # We want the model's uncertainty WHEN CHOOSING the first content token.
+        # So we use logits[first_content_pos - 1] which predicts first_content_pos.
+        entropy_pos = max(first_content_pos - 1, 0)
+        logits = outputs.logits[0, entropy_pos, :].float().cpu()
+
+        nan_cnt = int(torch.isnan(logits).sum().item())
+        inf_cnt = int(torch.isinf(logits).sum().item())
+        if nan_cnt > 0 or inf_cnt > 0:
+            print(f"    [WARN] logits: {nan_cnt} NaN, {inf_cnt} inf / {logits.numel()} total")
+            logits = torch.nan_to_num(logits, nan=-80.0, posinf=80.0, neginf=-80.0)
+
+        # Attention from analyze_pos (last content token) to ALL positions
+        all_layers_attn = np.stack(
+            [layer_attn[0, :, analyze_pos, :].float().cpu().numpy()
+             for layer_attn in outputs.attentions],
+            axis=0,
+        )  # (num_layers, num_heads, total_len)
+
+        if np.isnan(all_layers_attn).any():
+            nan_count = int(np.isnan(all_layers_attn).sum())
+            print(f"    [WARN] attention: {nan_count} NaN / {all_layers_attn.size} total values")
+            all_layers_attn = np.nan_to_num(all_layers_attn, nan=0.0)
+
+        prompt_attn = all_layers_attn[:, :, :input_length]  # (num_layers, num_heads, prompt_len)
+        input_ids_cpu = full_ids[0].cpu()
+
+        # --- Per-step attention evolution (V2 only) ---
+        # Because of causal masking, attention at position input_length + step
+        # only depends on tokens 0..input_length+step — identical to what the
+        # model saw during autoregressive generation at that step.
+        # We extract this by slicing the full attention matrix already computed.
+        per_step_data = None
+        if extract_per_step and num_generated > 0:
+            gen_token_texts = []
+            per_step_entropies = []
+            # Average attention over layers & heads: (num_steps, prompt_len)
+            per_step_avg_prompt_attn = np.zeros((num_generated, input_length), dtype=np.float32)
+            num_layers_actual = len(outputs.attentions)
+
+            for step in range(num_generated):
+                pos = input_length + step
+                gen_token_texts.append(
+                    tokenizer.decode([full_ids[0, pos].item()], clean_up_tokenization_spaces=False)
+                )
+
+                # Per-step entropy from the forward pass logits
+                step_logits = outputs.logits[0, pos, :].float().cpu()
+                step_logits = torch.nan_to_num(step_logits, nan=-80.0, posinf=80.0, neginf=-80.0)
+                per_step_entropies.append(compute_entropy(step_logits))
+                del step_logits
+
+                # Average attention from all layers & heads at this position → prompt
+                step_attn_sum = np.zeros(input_length, dtype=np.float32)
+                for layer_attn in outputs.attentions:
+                    # (1, heads, total_len, total_len) → (heads, prompt_len) → mean → (prompt_len,)
+                    step_attn_sum += layer_attn[0, :, pos, :input_length].float().mean(dim=0).cpu().numpy()
+                per_step_avg_prompt_attn[step] = step_attn_sum / num_layers_actual
+
+            per_step_data = {
+                "num_steps": num_generated,
+                "gen_tokens": gen_token_texts,
+                "per_step_entropy": per_step_entropies,
+                "avg_prompt_attn": per_step_avg_prompt_attn,  # (num_steps, prompt_len)
+            }
+
+        return {
+            "logits": logits,
+            "prompt_attn": prompt_attn,
+            "input_ids": input_ids_cpu,
+            "analyze_pos": analyze_pos,
+            "first_content_pos": first_content_pos,
+            "input_length": input_length,
+            "total_len": total_len,
+            "per_step_data": per_step_data,
+        }
+    else:
+        # === V1: Prompt-only fallback ===
+        inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=max_length)
+        input_ids = inputs["input_ids"].to(model.device)
+        attention_mask = inputs.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(model.device)
+
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,
+            )
+
+        logits = outputs.logits[0, -1, :].float().cpu()
+
+        nan_cnt = int(torch.isnan(logits).sum().item())
+        inf_cnt = int(torch.isinf(logits).sum().item())
+        if nan_cnt > 0 or inf_cnt > 0:
+            print(f"    [WARN] logits: {nan_cnt} NaN, {inf_cnt} inf / {logits.numel()} total  |  dtype={logits.dtype}")
+            logits = torch.nan_to_num(logits, nan=-80.0, posinf=80.0, neginf=-80.0)
+
+        all_layers_attn = np.stack(
+            [layer_attn[0, :, -1, :].float().cpu().numpy() for layer_attn in outputs.attentions],
+            axis=0,
         )
 
-    # outputs.logits: (1, seq_len, vocab_size)
-    # outputs.attentions: tuple of (1, num_heads, seq_len, seq_len), one per layer
-    logits = outputs.logits[0, -1, :].float().cpu()          # (vocab_size,) — next-token logits
+        if np.isnan(all_layers_attn).any():
+            nan_count = int(np.isnan(all_layers_attn).sum())
+            print(f"    [WARN] attention: {nan_count} NaN / {all_layers_attn.size} total values")
+            all_layers_attn = np.nan_to_num(all_layers_attn, nan=0.0)
 
-    # FIX: fp16 can produce inf/nan in logits.
-    # NaN → -80 (large negative so softmax gives ~zero probability — these tokens
-    #        should not influence the distribution)
-    # ±inf → ±80 (prevent exp overflow while preserving sign/ordering)
-    if torch.isnan(logits).any() or torch.isinf(logits).any():
-        nan_cnt = torch.isnan(logits).sum().item()
-        logits = torch.nan_to_num(logits, nan=-80.0, posinf=80.0, neginf=-80.0)
+        input_ids_cpu = input_ids[0].cpu()
+        seq_len = input_ids_cpu.shape[0]
 
-    # Extract attention from LAST position across ALL layers
-    # (num_layers, 1, num_heads, seq_len, seq_len) → (num_layers, num_heads, seq_len)
-    all_layers_attn = np.stack(
-        [layer_attn[0, :, -1, :].float().cpu().numpy() for layer_attn in outputs.attentions],
-        axis=0,
-    )  # (num_layers, num_heads, seq_len)
-
-    # FIX: fp16 attention can produce NaN in specific heads (e.g., Head 13 with GQA).
-    # Replace NaN with 0 (meaning "no attention from this head") so that
-    # mean across heads doesn't propagate NaN into all avg_attention values.
-    if np.isnan(all_layers_attn).any():
-        nan_count = int(np.isnan(all_layers_attn).sum())
-        all_layers_attn = np.nan_to_num(all_layers_attn, nan=0.0)
-
-    input_ids_cpu = input_ids[0].cpu()  # (seq_len,)
-
-    return logits, all_layers_attn, input_ids_cpu
+        return {
+            "logits": logits,
+            "prompt_attn": all_layers_attn,
+            "input_ids": input_ids_cpu,
+            "analyze_pos": seq_len - 1,
+            "input_length": seq_len,
+            "total_len": seq_len,
+        }
 
 
-def quick_entropy_scan(model, tokenizer, input_text: str, max_length: int = 2048) -> float:
+def quick_entropy_scan(model, tokenizer, input_text: str,
+                       generated_ids=None, input_length=None,
+                       max_length: int = 2048) -> float:
     """Fast forward pass WITHOUT attention — just compute output entropy.
 
-    Used in Pass 1 to scan the entropy distribution across all samples.
-    Much faster than forward_pass_with_attention because attention weights
-    are not materialized.
+    V2: entropy at the answer token position (when generated_ids provided).
+    V1: entropy at the last prompt position (fallback).
 
     Returns:
         entropy: float (NaN if forward pass fails)
     """
-    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=max_length)
-    input_ids = inputs["input_ids"].to(model.device)
-    attention_mask = inputs.get("attention_mask", None)
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(model.device)
+    if generated_ids is not None and input_length is not None:
+        # V2: Full sequence — entropy at answer position
+        full_ids = generated_ids.unsqueeze(0).to(model.device)
+        total_len = full_ids.shape[1]
+        if total_len > max_length:
+            full_ids = full_ids[:, :max_length]
+            total_len = max_length
+            input_length = min(input_length, max_length - 1)
 
-    with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        num_generated = total_len - input_length
 
-    logits = outputs.logits[0, -1, :].float().cpu()
+        # Skip structured format tokens to find the first content token
+        first_content_pos, _ = _find_answer_token_pos(
+            tokenizer, full_ids[0].tolist(), input_length, total_len,
+        )
 
-    # Same NaN/inf fix: nan → -80 so they get ~zero probability
-    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        # logits[pos] predicts token at pos+1; use first_content_pos - 1
+        # to capture the model's uncertainty when choosing the first content token.
+        entropy_pos = max(first_content_pos - 1, 0)
+
+        attention_mask = torch.ones_like(full_ids)
+        with torch.no_grad():
+            outputs = model(input_ids=full_ids, attention_mask=attention_mask)
+        logits = outputs.logits[0, entropy_pos, :].float().cpu()
+    else:
+        # V1: Prompt only
+        inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=max_length)
+        input_ids = inputs["input_ids"].to(model.device)
+        attention_mask = inputs.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(model.device)
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits[0, -1, :].float().cpu()
+
+    nan_cnt = int(torch.isnan(logits).sum().item())
+    inf_cnt = int(torch.isinf(logits).sum().item())
+    if nan_cnt > 0 or inf_cnt > 0:
+        print(f"    [WARN] entropy_scan logits: {nan_cnt} NaN, {inf_cnt} inf / {logits.numel()} total")
         logits = torch.nan_to_num(logits, nan=-80.0, posinf=80.0, neginf=-80.0)
 
     return compute_entropy(logits)
@@ -281,40 +633,75 @@ def decode_all_tokens(input_ids: torch.Tensor, tokenizer) -> List[str]:
 
 def analyze_one_sample(model, tokenizer, input_text: str,
                        top_k_candidates: int, top_k_tokens: int,
-                       max_length: int = 2048) -> Optional[Dict]:
+                       generated_ids=None, input_length=None,
+                       max_length: int = 2048,
+                       extract_per_step: bool = False) -> Optional[Dict]:
     """Full multi-layer analysis: forward pass WITH attention, extract decisive tokens per layer.
 
-    Assumes the caller has already determined this sample is high-entropy.
+    V2 (Redesigned): Analyzes attention from ANSWER token position WITHOUT filtering format tokens.
+    This version keeps ALL input tokens (including <|im_end|>, whitespace, etc.) to enable
+    full exploration of attention patterns across layers during reasoning.
+
+    Args:
+        extract_per_step: If True, extract attention at every generation step
+            to track how the model's focus evolves during generation.
+
     Returns analysis dict with per-layer data or None if forward pass fails.
     """
     try:
-        logits, all_layers_attn, input_ids = forward_pass_with_attention(
-            model, tokenizer, input_text, max_length,
+        fp_result = forward_pass_with_attention(
+            model, tokenizer, input_text,
+            generated_ids=generated_ids,
+            input_length=input_length,
+            max_length=max_length,
+            extract_per_step=extract_per_step,
         )
     except Exception as e:
         print(f"    Forward pass failed: {e}")
         return None
 
+    logits = fp_result["logits"]
+    prompt_attn = fp_result["prompt_attn"]  # (num_layers, num_heads, prompt_len)
+    input_ids = fp_result["input_ids"]
+    analyze_pos = fp_result["analyze_pos"]
+    first_content_pos = fp_result.get("first_content_pos", analyze_pos)
+    inp_len = fp_result["input_length"]
+    total_len = fp_result["total_len"]
+
     entropy = compute_entropy(logits)
     candidates = get_top_candidates(logits, tokenizer, top_k_candidates)
     all_tokens = decode_all_tokens(input_ids, tokenizer)
 
-    num_layers, num_heads, seq_len = all_layers_attn.shape
+    # Decode prompt and answer tokens separately
+    prompt_tokens = decode_all_tokens(input_ids[:inp_len], tokenizer)
+    answer_tokens = decode_all_tokens(input_ids[inp_len:], tokenizer)
 
-    # Per-layer decisive tokens
-    per_layer_decisive = []  # [(layer_idx, [decisive_token_dicts])] 
-    per_layer_attn_entropy = []  # attention entropy per layer
+    num_layers, num_heads, prompt_len = prompt_attn.shape
+
+    # NO FILTERING - Keep all tokens for full attention analysis
+    # This allows exploration of how model attends to ALL tokens (including format tokens)
+    # across different layers during reasoning process
+
+    # Per-layer decisive tokens (ALL prompt tokens, no filtering)
+    per_layer_decisive = []
+    per_layer_attn_entropy = []
+    per_layer_attn_matrix = []  # Store full attention matrix for each layer
 
     for layer_idx in range(num_layers):
-        layer_attn = all_layers_attn[layer_idx]  # (num_heads, seq_len)
+        layer_attn = prompt_attn[layer_idx]  # (num_heads, prompt_len)
 
-        # Layer attention entropy (how focused is this layer overall?)
-        avg_attn = layer_attn.mean(axis=0)  # (seq_len,)
+        # Average attention across heads
+        avg_attn = layer_attn.mean(axis=0)  # (prompt_len,)
+        
+        # Compute attention entropy (uncertainty in attention distribution)
         dist = avg_attn / (avg_attn.sum() + 1e-10)
         layer_ent = -(dist * np.log(dist + 1e-10)).sum()
-        per_layer_attn_entropy.append(layer_ent)
+        per_layer_attn_entropy.append(float(layer_ent))
 
-        # Top decisive tokens for this layer
+        # Store full attention distribution for this layer
+        per_layer_attn_matrix.append(avg_attn.copy())
+
+        # Extract top-k most attended tokens (ALL tokens, no filtering)
         layer_decisive = []
         top_positions = np.argsort(avg_attn)[::-1][:top_k_tokens]
         for pos in top_positions:
@@ -325,28 +712,37 @@ def analyze_one_sample(model, tokenizer, input_text: str,
                 "token_id": tid,
                 "position": int(pos),
                 "avg_attention": float(avg_attn[pos]),
+                "attention_rank": int(np.where(np.argsort(avg_attn)[::-1] == pos)[0][0] + 1),
             })
         per_layer_decisive.append((layer_idx, layer_decisive))
 
-    # Last-layer data (for backwards-compatible single-layer visualizations)
-    last_layer_attn = all_layers_attn[-1]  # (num_heads, seq_len)
-    last_layer_decisive = extract_decisive_tokens_from_attn(last_layer_attn, input_ids, tokenizer, top_k_tokens)
+    # Last layer analysis
+    last_layer_attn = prompt_attn[-1]
+    last_layer_decisive = extract_decisive_tokens_from_attn(
+        last_layer_attn, input_ids, tokenizer, top_k_tokens
+    )
 
     return {
         "input_text": input_text,
         "entropy": entropy,
         "num_layers": num_layers,
         "num_heads": num_heads,
-        "seq_len": seq_len,
+        "seq_len": prompt_len,
+        "analyze_pos": analyze_pos,
+        "first_content_pos": first_content_pos,
+        "input_length": inp_len,
+        "total_len": total_len,
+        "prompt_tokens": prompt_tokens,
+        "answer_tokens": answer_tokens,
         "candidates": candidates,
-        "all_tokens": all_tokens,
-        # Multi-layer data
-        "all_layers_attn": all_layers_attn,      # (num_layers, num_heads, seq_len)
-        "per_layer_decisive": per_layer_decisive, # [(layer_idx, [token_dicts])]
+        "all_tokens": all_tokens[:total_len],
+        "all_layers_attn": prompt_attn,  # (num_layers, num_heads, prompt_len)
+        "per_layer_decisive": per_layer_decisive,
         "per_layer_attn_entropy": per_layer_attn_entropy,
-        # Last-layer data (for backwards compat)
-        "per_head_attn": last_layer_attn,          # (num_heads, seq_len)
+        "per_layer_attn_matrix": per_layer_attn_matrix,  # List of (prompt_len,) arrays
+        "per_head_attn": last_layer_attn,
         "decisive_tokens": last_layer_decisive,
+        "per_step_data": fp_result.get("per_step_data"),
     }
 
 
@@ -803,6 +1199,156 @@ def plot_layer_consistency_ranking(samples: List[Dict], save_path: str, top_n: i
 
 
 # ============================================================
+# 6c. Per-Step Attention Evolution Visualizations
+# ============================================================
+
+def plot_generation_attention_evolution(samples: List[Dict], save_path: str,
+                                         max_samples: int = 6, top_prompt_tokens: int = 8):
+    """How attention to key prompt tokens evolves across generation steps.
+
+    For each high-entropy sample, the model generates a sequence of tokens
+    (answer letter for MC, chain-of-thought for GSM8K).  This plot shows,
+    at each generation step, how much attention the model gives to the top-K
+    most-attended prompt tokens.
+
+    Insight: does the model's focus shift from one part of the question to
+    another as it reasons?  Or does it consistently attend to the same tokens?
+    """
+    samples_with_steps = [s for s in samples if s.get("per_step_data") is not None]
+    if not samples_with_steps:
+        print("  [SKIP] No per-step attention data for generation evolution plot")
+        return
+
+    n = min(len(samples_with_steps), max_samples)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 3.5 * n), squeeze=False)
+    axes_flat = axes.flatten()
+
+    for idx, s in enumerate(samples_with_steps[:n]):
+        ax = axes_flat[idx]
+        psd = s["per_step_data"]
+        num_steps = psd["num_steps"]
+        gen_tokens = psd["gen_tokens"]
+        per_step_entropy = psd["per_step_entropy"]
+        avg_prompt_attn = psd["avg_prompt_attn"]  # (num_steps, prompt_len)
+
+        # Build content mask to exclude format tokens from ranking
+        input_ids = s.get("_input_ids")  # will be set by caller
+        content_mask = np.ones(avg_prompt_attn.shape[1], dtype=bool)
+        if input_ids is not None:
+            tokenizer = None  # not available here; use simple heuristic
+            # Filter positions with near-zero average attention across all steps
+            step_mean = avg_prompt_attn.mean(axis=0)
+            content_mask = step_mean > np.percentile(step_mean, 10)
+
+        # Find top-K prompt tokens by max attention across steps
+        max_attn_per_pos = avg_prompt_attn[:, content_mask].max(axis=0) if content_mask.any() else avg_prompt_attn.max(axis=0)
+        if content_mask.any():
+            content_indices = np.where(content_mask)[0]
+            top_local = np.argsort(max_attn_per_pos)[-top_prompt_tokens:]
+            top_positions = content_indices[top_local]
+        else:
+            top_positions = np.argsort(avg_prompt_attn.max(axis=0))[-top_prompt_tokens:]
+
+        top_positions = np.sort(top_positions)
+
+        # Get token labels from all_tokens
+        all_tokens = s.get("all_tokens", [])
+        token_labels = []
+        for p in top_positions:
+            if p < len(all_tokens):
+                label = all_tokens[p].strip()[:15].replace('\n', '↵')
+            else:
+                label = f"pos{p}"
+            token_labels.append(label)
+
+        # Plot lines
+        steps = list(range(num_steps))
+        colors = plt.cm.tab10(np.linspace(0, 1, len(top_positions)))
+        for k, (pos, label) in enumerate(zip(top_positions, token_labels)):
+            ax.plot(steps, avg_prompt_attn[:, pos], '-o', markersize=2,
+                    linewidth=1.5, color=colors[k], label=label, alpha=0.8)
+
+        # Overlay entropy on twin axis
+        ax2 = ax.twinx()
+        ax2.bar(steps, per_step_entropy, alpha=0.15, color='gray', width=0.8, label='entropy')
+        ax2.set_ylabel("Entropy (nats)", fontsize=7, color='gray')
+        ax2.tick_params(axis='y', labelsize=6, colors='gray')
+        ax2.set_ylim(0, max(per_step_entropy) * 1.5 + 0.1)
+
+        # Generation token labels on x-axis
+        short_gen = [t.strip()[:6].replace('\n', '↵') for t in gen_tokens]
+        ax.set_xticks(steps)
+        ax.set_xticklabels(short_gen, rotation=45, ha='right', fontsize=5)
+        ax.set_ylabel("Avg attention to prompt", fontsize=7)
+        ax.set_title(f"S{idx}: H_final={s['entropy']:.2f}  "
+                     f"top={s['candidates'][0]['token']}={s['candidates'][0]['prob']:.2f}  "
+                     f"({num_steps} gen steps)",
+                     fontsize=9)
+        if idx == 0:
+            ax.legend(loc='upper left', fontsize=5, ncol=2, framealpha=0.8)
+
+    fig.suptitle("Generation-Step Attention Evolution\n"
+                 "(Lines = attention to top prompt tokens at each step, "
+                 "Bars = output entropy per step)",
+                 fontsize=11, y=1.01)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved generation attention evolution: {save_path}")
+
+
+def plot_per_step_entropy_profile(samples: List[Dict], save_path: str,
+                                   max_samples: int = 20):
+    """Entropy profile across generation steps for all high-entropy samples.
+
+    X-axis: generation step index
+    Y-axis: entropy at each step
+    One line per sample, colored by whether the answer is correct.
+
+    Insight: for MC tasks, step 0 (the answer letter) should have high entropy
+    for uncertain samples.  For GSM8K, entropy may spike at key reasoning steps.
+    """
+    samples_with_steps = [s for s in samples if s.get("per_step_data") is not None]
+    if not samples_with_steps:
+        print("  [SKIP] No per-step data for entropy profile")
+        return
+
+    n = min(len(samples_with_steps), max_samples)
+    fig, ax = plt.subplots(figsize=(13, max(5, n * 0.25)))
+
+    for idx, s in enumerate(samples_with_steps[:n]):
+        psd = s["per_step_data"]
+        steps = list(range(psd["num_steps"]))
+        entropies = psd["per_step_entropy"]
+        is_correct = s.get("is_correct")
+        color = 'steelblue' if is_correct else 'coral'
+        marker = 'o' if is_correct else 'x'
+        label = f"S{idx}" if idx < 10 else ""
+        ax.plot(steps, entropies, f'-{marker}', markersize=3, linewidth=1.2,
+                color=color, alpha=0.7, label=label)
+
+    # Legend proxy
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color='steelblue', marker='o', linestyle='-', markersize=4, label='Correct'),
+        Line2D([0], [0], color='coral', marker='x', linestyle='-', markersize=4, label='Wrong'),
+    ]
+    ax.legend(handles=legend_elements, loc='best', fontsize=8)
+
+    ax.set_xlabel("Generation step", fontsize=10)
+    ax.set_ylabel("Entropy (nats)", fontsize=10)
+    ax.set_title("Per-Step Entropy Profile During Generation\n"
+                 "(How model uncertainty evolves as it generates each token)",
+                 fontsize=11)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved per-step entropy profile: {save_path}")
+
+
+# ============================================================
 # 7. Text Report
 # ============================================================
 
@@ -820,12 +1366,32 @@ def generate_text_report(samples: List[Dict], save_path: str, max_display: int =
         lines.append(f"Entropy mean:  {np.mean(ents):.3f} nats")
         lines.append(f"Entropy std:   {np.std(ents):.3f} nats")
 
+    # Accuracy summary at the top
+    samples_with_gt = [s for s in samples if s.get("is_correct") is not None]
+    if samples_with_gt:
+        correct = sum(1 for s in samples_with_gt if s["is_correct"])
+        lines.append(f"\nAccuracy among high-entropy samples: {correct}/{len(samples_with_gt)} "
+                     f"({100*correct/len(samples_with_gt):.1f}%)")
+        lines.append(f"  Correct & uncertain: {correct}")
+        lines.append(f"  Wrong & uncertain:   {len(samples_with_gt) - correct}")
+    
+    lines.append(f"\nAnalysis mode: ALL tokens (including format tokens like <|im_end|>, whitespace, etc.)")
+    lines.append(f"This enables full exploration of attention patterns across all layers.")
+
     for idx, s in enumerate(samples[:max_display]):
         lines.append(f"\n{'─' * 70}")
+        gt_answer = s.get("ground_truth", {}).get("answer", "?") if s.get("ground_truth") else "?"
+        model_ans = s.get("model_answer", "?")
+        is_correct = s.get("is_correct", None)
+        correct_tag = "" if is_correct is None else (" CORRECT" if is_correct else " WRONG")
         lines.append(f"Sample {idx + 1}  |  Entropy = {s['entropy']:.3f} nats  |  "
                      f"Layers = {s['num_layers']}  |  Heads = {s['num_heads']}  |  "
-                     f"Seq = {s['seq_len']}")
+                     f"Seq = {s['seq_len']}{correct_tag}")
         lines.append(f"{'─' * 70}")
+
+        # Ground truth and model answer
+        if gt_answer != "?":
+            lines.append(f"  Ground truth: {gt_answer}  |  Model answer: {model_ans}")
 
         # Input text (truncated for readability)
         inp = s["input_text"]
@@ -894,6 +1460,20 @@ def generate_text_report(samples: List[Dict], save_path: str, max_display: int =
                 head_str = "  ".join([f"H{h}={hw[h]:.4f}" for h in top_heads])
                 lines.append(f"        Top heads: {head_str}")
 
+        # Per-step generation summary (new)
+        psd = s.get("per_step_data")
+        if psd and psd.get("num_steps", 0) > 1:
+            lines.append(f"\n  Per-step generation analysis ({psd['num_steps']} steps):")
+            gen_tokens = psd["gen_tokens"]
+            per_step_ent = psd["per_step_entropy"]
+            for step_i in range(min(len(gen_tokens), 12)):
+                tok = gen_tokens[step_i].strip()[:10].replace('\n', '↵')
+                ent_val = per_step_ent[step_i] if step_i < len(per_step_ent) else -1
+                bar = "█" * int(ent_val * 8) if ent_val > 0 else ""
+                lines.append(f"    Step {step_i:2d}: '{tok}'  H={ent_val:.3f}  {bar}")
+            if len(gen_tokens) > 12:
+                lines.append(f"    ... ({len(gen_tokens) - 12} more steps)")
+
     lines.append(f"\n{'=' * 80}")
 
     report = "\n".join(lines)
@@ -913,11 +1493,19 @@ def save_analysis_json(samples: List[Dict], save_path: str):
     json_data = []
     for s in samples:
         json_data.append({
+            "sample_idx": int(s.get("sample_idx", -1)),
             "input_text": s["input_text"],
             "entropy": float(s["entropy"]),
             "num_layers": int(s["num_layers"]),
             "num_heads": int(s["num_heads"]),
             "seq_len": int(s["seq_len"]),
+            "input_length": int(s.get("input_length", s["seq_len"])),
+            "analyze_pos": int(s.get("analyze_pos", -1)),
+            "first_content_pos": int(s.get("first_content_pos", -1)),
+            "total_len": int(s.get("total_len", s["seq_len"])),
+            "ground_truth_answer": s.get("ground_truth", {}).get("answer", "") if s.get("ground_truth") else "",
+            "model_answer": s.get("model_answer", ""),
+            "is_correct": s.get("is_correct", None),
             "candidates": s["candidates"],
             "per_layer_attn_entropy": [float(x) for x in s["per_layer_attn_entropy"]],
             "per_layer_top3": {
@@ -925,6 +1513,8 @@ def save_analysis_json(samples: List[Dict], save_path: str):
                 for layer_idx, decisive in s["per_layer_decisive"]
             },
             "last_layer_decisive_tokens": s["decisive_tokens"],
+            "per_step_entropy": s.get("per_step_data", {}).get("per_step_entropy", []),
+            "per_step_gen_tokens": s.get("per_step_data", {}).get("gen_tokens", []),
         })
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -976,6 +1566,11 @@ Examples (standalone):
                         help="Max samples in plots and text report")
     parser.add_argument("--max_seq_length", type=int, default=2048,
                         help="Max input sequence length (truncate longer)")
+    parser.add_argument("--correct_only", action="store_true", default=True,
+                        help="Only analyze correct answers (default: True). "
+                             "Use --no-correct_only to include wrong answers.")
+    parser.add_argument("--no-correct_only", dest="correct_only", action="store_false",
+                        help="Include both correct and wrong answers in analysis.")
     args = parser.parse_args()
 
     # Determine thresholding mode
@@ -994,6 +1589,7 @@ Examples (standalone):
         thr = args.entropy_threshold if args.entropy_threshold is not None else 0.5
         print(f"  Threshold mode: fixed ({thr} nats)")
     print(f"  Max display: {args.max_display}")
+    print(f"  Correct only: {args.correct_only}")
     print("=" * 80)
 
     # Output directory
@@ -1007,8 +1603,14 @@ Examples (standalone):
     model_output_dir = MODELS[args.model]["output_dir"]
     print(f"\nLoading input texts from: {model_output_dir}")
 
-    # Pre-load all (index, input_text) pairs
-    sample_pairs = []  # [(index, input_text), ...]
+    # Pre-load all (index, input_text, gt, model_answer, is_correct, generated_ids, input_length, step2_output) tuples
+    # The step2_output is kept only for fast-entropy extraction in Pass 1.
+    # sample_pairs: [(index, input_text, gt, model_answer, is_correct, generated_ids, input_length, step2_output), ...]
+    sample_pairs = []
+    from qa_utils import get_clean_answer, get_gt_answer, compare_answers
+
+    correct_count = 0
+    total_with_gt = 0
     for i in range(args.num_samples):
         output = load_model_output(model_output_dir, i)
         if output is None:
@@ -1016,32 +1618,102 @@ Examples (standalone):
         input_text = output.get("input_text")
         if not input_text:
             continue
-        sample_pairs.append((i, input_text))
 
-    print(f"  Loaded {len(sample_pairs)} valid samples\n")
+        # Extract ground truth and model answer using centralized get_clean_answer
+        gt = output.get("ground_truth", {})
+        gt_answer = get_gt_answer(gt)
+        model_answer, answer_type = get_clean_answer(output)
+
+        # Check correctness if ground truth is available
+        is_correct = None
+        if gt_answer:
+            total_with_gt += 1
+            comparison = compare_answers(model_answer, gt)
+            is_correct = comparison.get("match", False)
+            if is_correct:
+                correct_count += 1
+
+        # Load generated_ids and input_length for V2 forward pass
+        generated_ids = output.get("generated_ids")
+        input_length = None
+        if generated_ids is not None:
+            input_length = len(generated_ids) - output.get("num_generated_tokens", 0)
+            if input_length <= 0:
+                input_length = None
+                generated_ids = None
+
+        # Keep step2 output for fast-entropy path; extract only the minimal
+        # data needed (logits_per_step or top_k_info) to avoid holding large
+        # tensors for all 100 samples simultaneously.
+        fast_data = _extract_fast_entropy_data(output)
+
+        sample_pairs.append((i, input_text, gt, model_answer, is_correct, generated_ids, input_length, fast_data))
+
+    print(f"  Loaded {len(sample_pairs)} valid samples")
+    v2_count = sum(1 for _, _, _, _, _, gid, il, _ in sample_pairs if gid is not None)
+    print(f"  V2 (answer-position): {v2_count}, V1 (prompt-only fallback): {len(sample_pairs) - v2_count}")
+    fast_count_pre = sum(1 for _, _, _, _, _, _, _, fd in sample_pairs if fd is not None)
+    print(f"  Fast-entropy eligible: {fast_count_pre}/{len(sample_pairs)}")
+    if total_with_gt > 0:
+        print(f"  Accuracy: {correct_count}/{total_with_gt} ({100*correct_count/total_with_gt:.1f}%)")
+
+    # Filter: correct_only — only analyze samples where the model answered correctly
+    if args.correct_only:
+        before_count = len(sample_pairs)
+        sample_pairs = [(i, txt, gt, ma, ic, gid, il, fd)
+                        for i, txt, gt, ma, ic, gid, il, fd in sample_pairs
+                        if ic is None or ic]  # keep correct + unknown (no GT)
+        skipped = before_count - len(sample_pairs)
+        print(f"  [correct_only] Filtered out {skipped} wrong-answer samples, "
+              f"{len(sample_pairs)} remaining")
+        if skipped > 0:
+            rem_with_gt = [p for p in sample_pairs if p[4] is not None]
+            rem_correct = sum(1 for p in rem_with_gt if p[4])
+            print(f"  [correct_only] Remaining accuracy: {rem_correct}/{len(rem_with_gt)}")
+
+    print()
 
     # ================================================================
-    # Pass 1: Fast entropy scan (NO attention output — much faster)
+    # Pass 1: Fast entropy scan — prefer step2 data (NO forward pass)
     # ================================================================
-    print(f"Pass 1/2: Scanning entropy distribution ({len(sample_pairs)} samples)...")
-    sample_entropies = []  # [(index, input_text, entropy), ...]
+    filter_note = " [correct_only]" if args.correct_only else ""
+    print(f"Pass 1/2: Scanning entropy distribution ({len(sample_pairs)} samples){filter_note}...")
+    print(f"  Strategy: use step2 scores first, forward pass as fallback")
+    sample_entropies = []  # [(index, input_text, entropy, gt, model_answer, is_correct, generated_ids, input_length), ...]
     nan_count = 0
-    for idx, input_text in tqdm(sample_pairs, desc="  Scanning"):
+    fast_hit = 0
+    fp_fallback = 0
+    for idx, input_text, gt, model_answer, is_correct, gen_ids, inp_len, fast_data in tqdm(sample_pairs, desc="  Scanning"):
         try:
-            ent = quick_entropy_scan(model, tokenizer, input_text, args.max_seq_length)
+            # --- Fast path: reuse step2's generation scores ---
+            ent = None
+            source = None
+            if fast_data is not None:
+                ent, source = _fast_entropy_from_step2(fast_data)
+                if ent is not None:
+                    fast_hit += 1
+
+            # --- Fallback: full forward pass ---
+            if ent is None:
+                ent = quick_entropy_scan(model, tokenizer, input_text,
+                                          generated_ids=gen_ids, input_length=inp_len,
+                                          max_length=args.max_seq_length)
+                fp_fallback += 1
+
             if np.isnan(ent):
                 nan_count += 1
             else:
-                sample_entropies.append((idx, input_text, ent))
+                sample_entropies.append((idx, input_text, ent, gt, model_answer, is_correct, gen_ids, inp_len))
         except Exception as e:
             print(f"    Sample {idx} failed: {e}")
             nan_count += 1
 
     # Entropy distribution report
-    valid_entropies = np.array([e for _, _, e in sample_entropies])
+    valid_entropies = np.array([e for _, _, e, _, _, _, _, _ in sample_entropies])
 
     print(f"\n{'=' * 60}")
     print(f"Pass 1 complete: {len(sample_entropies)} valid, {nan_count} NaN")
+    print(f"  Fast path (step2 scores): {fast_hit}, Forward pass fallback: {fp_fallback}")
     if len(valid_entropies) > 0:
         print(f"  Entropy distribution (all valid samples):")
         print(f"    min={valid_entropies.min():.3f}  median={np.median(valid_entropies):.3f}  "
@@ -1062,10 +1734,19 @@ Examples (standalone):
         print(f"\n  Fixed threshold: {threshold:.3f} nats")
 
     # Select high-entropy samples for Pass 2
-    high_entropy_pairs = [(idx, text, ent) for idx, text, ent in sample_entropies
+    high_entropy_pairs = [(idx, text, ent, gt, model_answer, is_correct, gen_ids, inp_len)
+                          for idx, text, ent, gt, model_answer, is_correct, gen_ids, inp_len in sample_entropies
                           if ent >= threshold]
     # Sort by entropy descending
     high_entropy_pairs.sort(key=lambda x: x[2], reverse=True)
+
+    # Accuracy breakdown for high-entropy samples
+    he_with_gt = [(idx, text, ent, gt, ma, ic, gi, il) for idx, text, ent, gt, ma, ic, gi, il in high_entropy_pairs if ic is not None]
+    if he_with_gt:
+        he_correct = sum(1 for _, _, _, _, _, ic, _, _ in he_with_gt if ic)
+        print(f"  High-entropy accuracy: {he_correct}/{len(he_with_gt)} ({100*he_correct/len(he_with_gt):.1f}%)")
+        he_wrong = [(idx, text, ent, gt, ma, ic, gi, il) for idx, text, ent, gt, ma, ic, gi, il in he_with_gt if not ic]
+        print(f"  High-entropy wrong:   {len(he_wrong)}/{len(he_with_gt)}")
 
     n_high = len(high_entropy_pairs)
     print(f"  Selected: {n_high} samples with H >= {threshold:.3f} "
@@ -1089,16 +1770,30 @@ Examples (standalone):
     print(f"\nPass 2/2: Detailed attention analysis ({n_high} high-entropy samples)...")
     high_entropy_samples = []
     all_entropies = []
-    for idx, input_text, _ in tqdm(high_entropy_pairs, desc="  Analyzing"):
+    for idx, input_text, ent, gt, model_answer, is_correct, gen_ids, inp_len in tqdm(high_entropy_pairs, desc="  Analyzing"):
         result = analyze_one_sample(
             model, tokenizer, input_text,
             top_k_candidates=args.top_k_candidates,
             top_k_tokens=args.top_k_tokens,
+            generated_ids=gen_ids,
+            input_length=inp_len,
             max_length=args.max_seq_length,
+            extract_per_step=True,
         )
         if result is not None:
+            # Attach ground truth and correctness info
+            result["sample_idx"] = idx
+            result["ground_truth"] = gt
+            result["model_answer"] = model_answer
+            result["is_correct"] = is_correct
             high_entropy_samples.append(result)
             all_entropies.append(result["entropy"])
+
+    # Accuracy summary in Pass 2
+    he2_with_gt = [s for s in high_entropy_samples if s["is_correct"] is not None]
+    if he2_with_gt:
+        he2_correct = sum(1 for s in he2_with_gt if s["is_correct"])
+        print(f"  Pass2 accuracy: {he2_correct}/{len(he2_with_gt)} ({100*he2_correct/len(he2_with_gt):.1f}%)")
 
     print(f"\n{'=' * 60}")
     print(f"Results: {len(high_entropy_samples)} samples analyzed successfully")
@@ -1172,6 +1867,21 @@ Examples (standalone):
             high_entropy_samples,
             os.path.join(output_dir, "layer_consistency_ranking.png"),
             top_n=20,
+        )
+
+        # --- Per-step generation visualizations (new) ---
+        print("  Generating per-step generation analysis...")
+        plot_generation_attention_evolution(
+            high_entropy_samples,
+            os.path.join(output_dir, "generation_attention_evolution.png"),
+            max_samples=min(args.max_display, 6),
+            top_prompt_tokens=8,
+        )
+
+        plot_per_step_entropy_profile(
+            high_entropy_samples,
+            os.path.join(output_dir, "per_step_entropy_profile.png"),
+            max_samples=min(len(high_entropy_samples), 20),
         )
 
     # Cleanup

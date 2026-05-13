@@ -1,5 +1,5 @@
 """
-Step 7: Injection Experiment (V3 — QA tasks, optimized)
+Step 8: Injection Experiment (V3 — QA tasks, optimized)
 
 Inject small model's hidden states into large model and evaluate the effect.
 
@@ -27,7 +27,7 @@ from config import (
 )
 from qa_utils import (
     extract_answer, compare_answers, get_gt_answer, get_answer_type,
-    get_answer_token_id, find_answer_step,
+    get_answer_token_id, find_answer_step, get_clean_answer,
 )
 from utils import load_model_output, cleanup_gpu
 
@@ -208,9 +208,10 @@ def run_injection_experiment(
 
     probs_data["original_large_probs"] = original_probs
 
-    # Parse predicted answer
-    gen_text = small_model_output.get("generated_text", "")
-    pred_answer = extract_answer(gen_text, answer_type)
+    # Parse predicted answer using centralized get_clean_answer
+    pred_answer, answer_type = get_clean_answer(small_model_output)
+    if not answer_type:
+        answer_type = get_answer_type(ground_truth)
 
     if not pred_answer or not gt_answer:
         return results, probs_data
@@ -314,7 +315,7 @@ def run_injection_experiment(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Step 7: Injection Experiment (QA tasks)")
+    parser = argparse.ArgumentParser(description="Step 8: Injection Experiment (QA tasks)")
     parser.add_argument("--small_model", type=str, default="qwen3B")
     parser.add_argument("--large_model", type=str, default="qwen7B")
     parser.add_argument("--max_samples", type=int, default=50)
@@ -322,7 +323,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 80)
-    print(f"Step 7: Injection Experiment ({args.small_model} -> {args.large_model})")
+    print(f"Step 8: Injection Experiment ({args.small_model} -> {args.large_model})")
     print("=" * 80)
 
     # Resolve error analysis path
