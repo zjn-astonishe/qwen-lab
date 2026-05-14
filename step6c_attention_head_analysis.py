@@ -6,8 +6,9 @@ Step 6c: Attention Head Ablation Analysis
 核心方法：
   1. 加载完整模型，对每个错误样本做一次forward pass
   2. 通过hook捕获每层attention的per-head输出（o_proj的输入 = 拼接的各head输出）
-  3. 用o_proj权重分解出每个head对hidden state的贡献向量:
-     contribution_i = per_head_output[:, :, i, :] @ o_proj_weight[:, i*head_dim:(i+1)*head_dim].T
+  3. 用各层自己的o_proj权重分解出每个head对hidden state的贡献向量:
+     contribution_i = per_head_output[:, :, i, :] @ o_proj_weight_L[:, i*head_dim:(i+1)*head_dim].T
+     注意：每个Transformer层L有自己的o_proj权重，必须用对应层的权重分解。
   4. 对每个head计算GT-Pred对齐贡献分:
      score_i = cos(contribution_i, w_GT) - cos(contribution_i, w_Pred)
      score > 0 → 该head帮助对齐GT（"好头"）
@@ -28,7 +29,8 @@ Step 6c: Attention Head Ablation Analysis
 输出：
   - attention_head_heatmap_{model}.png  (layer × head 热力图, 每个模型一张)
   - attention_head_comparison.png      (三模型对比图)
-  - bad_head_ranking.json              (按"破坏力"排序的head列表)
+  - head_analysis_{tag}.json           (每模型的详细分析结果)
+  - head_analysis_summary.json         (跨模型综合摘要)
 """
 
 import os
@@ -130,23 +132,22 @@ def get_model_head_info(model_key: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 class PerHeadContributionExtractor:
-    """通过hook捕获attention per-head输出，并用o_proj分解per-head贡献。
+    """通过hook捕获attention per-head输出。
 
     核心原理：
       attention层输出 = o_proj(concat(head_0_out, head_1_out, ..., head_{n-1}_out))
       其中 concat后的形状 = [batch, seq, num_heads * head_dim]
-      o_proj的权重形状 = [hidden_dim, num_heads * head_dim]
 
-      因此，head i 的贡献 = head_i_out @ o_proj_weight[:, i*head_dim:(i+1)*head_dim].T
-      head_i_out 形状 = [batch, seq, head_dim]
-      contribution_i 形状 = [batch, seq, hidden_dim]
+      hook在o_proj的输入端捕获concatenated per-head outputs，
+      之后在CPU上用对应层的o_proj权重进行per-head贡献分解。
     """
 
     def __init__(self, model, device: str = "cpu"):
         self.model = model
         self.device = device
         self.hooks = []
-        # storage[layer_idx] = per_head_outputs tensor [batch, seq, num_heads, head_dim]
+        # storage[layer_idx] = per_head_outputs tensor [num_heads, head_dim]
+        # （仅保存prefill最后一个token位置，batch=1已squeeze掉）
         self.storage = {}
 
     def _make_hook(self, layer_idx: int, num_heads: int, head_dim: int):
@@ -185,16 +186,38 @@ class PerHeadContributionExtractor:
         return dict(self.storage)
 
 
+def collect_per_layer_o_proj_weights(
+    model, layers_to_hook: List[int]
+) -> Dict[int, torch.Tensor]:
+    """收集每层独立的o_proj权重。
+
+    每个Transformer层L有自己的o_proj权重 W_L，用于分解该层的per-head输出。
+    shape: [hidden_dim, num_heads * head_dim]
+
+    Returns:
+        {layer_idx: tensor[hidden_dim, num_heads * head_dim]}
+    """
+    weights = {}
+    for layer_idx in layers_to_hook:
+        w = model.model.layers[layer_idx].self_attn.o_proj.weight.data.float().cpu()
+        weights[layer_idx] = w
+    return weights
+
+
 def compute_per_head_contributions(
     per_head_outputs: Dict[int, torch.Tensor],
-    o_proj_weight: torch.Tensor,
+    per_layer_o_proj_weights: Dict[int, torch.Tensor],
     head_dim: int,
 ) -> Dict[int, torch.Tensor]:
-    """从per-head outputs和o_proj权重计算每个head的贡献向量。
+    """从per-head outputs和各层独立的o_proj权重计算每个head的贡献向量。
+
+    关键：Layer L 的 head i 贡献必须用 Layer L 自己的 o_proj 权重分解：
+      contribution_i = head_i_out @ o_proj_weight_L[:, i*head_dim:(i+1)*head_dim].T
 
     Args:
         per_head_outputs: {layer_idx: tensor[num_heads, head_dim]}
-        o_proj_weight: tensor[hidden_dim, num_heads * head_dim]
+                          （hook捕获的，已detach到CPU）
+        per_layer_o_proj_weights: {layer_idx: tensor[hidden_dim, num_heads * head_dim]}
         head_dim: 每个头的维度
 
     Returns:
@@ -203,15 +226,13 @@ def compute_per_head_contributions(
     num_heads = list(per_head_outputs.values())[0].shape[0] if per_head_outputs else 0
     contributions = {}
 
-    # o_proj_weight可能在GPU上，但per_head_outputs在CPU上（hook中detach().cpu()）
-    # 统一移到CPU进行计算（per-head贡献分解计算量很小）
-    if o_proj_weight.device.type != "cpu":
-        o_proj_weight = o_proj_weight.float().cpu()
-
     for layer_idx, ph_out in per_head_outputs.items():
+        # 获取该层自己的o_proj权重
+        if layer_idx not in per_layer_o_proj_weights:
+            continue
+        o_proj_weight = per_layer_o_proj_weights[layer_idx]  # [hidden_dim, num_heads * head_dim], 已在CPU
+
         # ph_out: [num_heads, head_dim]
-        # o_proj_weight: [hidden_dim, num_heads * head_dim]
-        # 对每个head i: contribution_i = ph_out[i] @ o_proj_weight[:, i*head_dim:(i+1)*head_dim].T
         contrib_list = []
         for h in range(num_heads):
             start = h * head_dim
@@ -249,12 +270,11 @@ def compute_head_alignment_scores(
         {layer_idx: tensor[num_heads]} — 每层每个head的score
     """
     scores = {}
-    # contributions在CPU上（来自compute_per_head_contributions），统一w到CPU
+    # contributions和w统一在CPU + float32计算
     w_gt = w_gt.float().cpu()
     w_pred = w_pred.float().cpu()
     for layer_idx, contrib in contributions.items():
         # contrib: [num_heads, hidden_dim]
-        # w_gt, w_pred: [hidden_dim]
         cos_gt = F.cosine_similarity(contrib, w_gt.unsqueeze(0), dim=-1)  # [num_heads]
         cos_pred = F.cosine_similarity(contrib, w_pred.unsqueeze(0), dim=-1)  # [num_heads]
         scores[layer_idx] = cos_gt - cos_pred
@@ -265,6 +285,7 @@ def analyze_one_sample(
     model,
     tokenizer,
     extractor: PerHeadContributionExtractor,
+    per_layer_o_proj_weights: Dict[int, torch.Tensor],
     sample: Dict[str, Any],
     lm_head_weight: torch.Tensor,
     option_token_ids: Dict[str, int],
@@ -275,10 +296,25 @@ def analyze_one_sample(
 ) -> Optional[Dict[str, Any]]:
     """对一个样本执行完整的per-head分析。
 
+    Args:
+        model: 模型
+        tokenizer: tokenizer
+        extractor: per-head hook提取器
+        per_layer_o_proj_weights: 预先收集的各层o_proj权重（避免重复读取）
+        sample: 样本数据
+        lm_head_weight: LM Head权重 [vocab_size, hidden_dim]
+        option_token_ids: 选项字母→token_id映射
+        model_key: 模型名称
+        layers_to_hook: 要分析的层列表
+        head_info: head配置信息
+        device: 计算设备
+
     Returns:
         {
             "sample_idx": int,
             "sample_id": str,
+            "gt_answer": str,
+            "pred_answer": str,
             "per_layer_head_scores": {layer_idx: [head_scores]},
             "top_bad_heads": [(layer, head, score)],
             "top_good_heads": [(layer, head, score)],
@@ -287,7 +323,7 @@ def analyze_one_sample(
     num_heads = head_info["num_heads"]
     head_dim = head_info["head_dim"]
 
-    # ---- 获取GT/Pred ----
+    # ---- 获取GT ----
     gt_answer = get_gt_answer(sample.get("ground_truth", {}))
     answer_type = get_answer_type(sample.get("ground_truth", {}))
     if not gt_answer or answer_type != "multiple_choice":
@@ -320,51 +356,43 @@ def analyze_one_sample(
     if attention_mask is not None:
         attention_mask = attention_mask.to(model.device)
 
-    # ---- 获取Pred token（从已有模型输出推断，或用logit最高选项）----
-    # 注意：这里无法直接获取pred_answer（需要原始step2输出）
-    # 我们只用GT进行分析——寻找哪些head帮助对齐GT，哪些head反对GT
-    # 但为了与step6b一致，也计算Pred
-    # 用一个简单的heuristic：从model forward pass获取logits，取非GT最高选项
-    pred_tid = None
-    pred_letter = None
-
     # ---- Forward pass with hooks ----
+    # [FIX Bug 3] output_hidden_states=True 以便获取last hidden state推断Pred
     extractor.register_hooks(layers_to_hook, num_heads, head_dim)
 
     with torch.inference_mode():
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=False,
+            output_hidden_states=True,
             output_attentions=False,
         )
-        # 用最后一层的hidden state计算logits来推断pred
-        last_hidden = outputs.hidden_states[-1][:, -1, :] if outputs.hidden_states else None
 
     # 获取per-head outputs
     per_head_outputs = extractor.get_per_head_outputs()
     extractor.remove_hooks()
 
     if not per_head_outputs:
+        del outputs
         return None
 
-    # ---- 获取w_GT ----
-    w_gt = lm_head_weight[gt_tid].float().to(device)  # [hidden_dim]
+    # ---- 获取last hidden state → 推断Pred选项 ----
+    last_hidden = outputs.hidden_states[-1][:, -1, :].float().cpu()  # [1, hidden_dim]
+    lm_head_cpu = lm_head_weight.float().cpu()
+    logits = last_hidden @ lm_head_cpu.T  # [1, vocab]
 
-    # ---- 推断Pred选项 ----
-    if last_hidden is not None:
-        last_h = last_hidden.float().to(device)
-        logits = last_h @ lm_head_weight.float().to(device).T  # [1, vocab]
-        # 找非GT选项中logit最高的
-        best_score = -float("inf")
-        for letter, tid in option_token_ids.items():
-            if letter == gt_letter:
-                continue
-            score = logits[0, tid].item()
-            if score > best_score:
-                best_score = score
-                pred_tid = tid
-                pred_letter = letter
+    # 找非GT选项中logit最高的作为Pred
+    pred_tid = None
+    pred_letter = None
+    best_score = -float("inf")
+    for letter, tid in option_token_ids.items():
+        if letter == gt_letter:
+            continue
+        score = logits[0, tid].item()
+        if score > best_score:
+            best_score = score
+            pred_tid = tid
+            pred_letter = letter
 
     if pred_tid is None:
         # fallback: 用第一个非GT选项
@@ -374,18 +402,19 @@ def analyze_one_sample(
                 pred_letter = letter
                 break
 
-    w_pred = lm_head_weight[pred_tid].float().to(device)
-
-    # ---- 获取o_proj权重 ----
-    # 取任意一个hooked层的o_proj权重（所有层shape相同）
-    sample_layer = layers_to_hook[0]
-    o_proj_weight = model.model.layers[sample_layer].self_attn.o_proj.weight.data.float().to(device)
-    # [hidden_dim, num_heads * head_dim]
+    # ---- 获取w_GT / w_Pred ----
+    w_gt = lm_head_weight[gt_tid].float().cpu()    # [hidden_dim]
+    w_pred = lm_head_weight[pred_tid].float().cpu()  # [hidden_dim]
 
     # ---- 计算per-head贡献 ----
+    # [FIX Bug 1] 使用各层独立的o_proj权重进行分解
     contributions = compute_per_head_contributions(
-        per_head_outputs, o_proj_weight, head_dim
+        per_head_outputs, per_layer_o_proj_weights, head_dim
     )
+
+    if not contributions:
+        del outputs, last_hidden
+        return None
 
     # ---- 计算对齐分数 ----
     head_scores = compute_head_alignment_scores(contributions, w_gt, w_pred)
@@ -401,11 +430,10 @@ def analyze_one_sample(
 
     # 排序
     sorted_entries = sorted(all_head_entries, key=lambda x: x[2])
-    top_bad = sorted_entries[:10]  # 最负 = 最"坏"
+    top_bad = sorted_entries[:10]   # 最负 = 最"坏"
     top_good = sorted_entries[-10:][::-1]  # 最正 = 最"好"
 
-    del outputs
-    del last_hidden
+    del outputs, last_hidden
 
     return {
         "sample_idx": sample.get("_idx", -1),
@@ -450,9 +478,11 @@ def plot_head_heatmap(
     model_name: str,
     output_dir: str,
 ):
-    """绘制单个模型的 layer × head 对齐分数热力图。
+    """绘制单个模型的 layer x head 对齐分数热力图。
 
-    颜色：红色 = 坏头（帮助Pred），蓝色 = 好头（帮助GT）
+    [FIX Bug 2] 使用 RdBu_r colormap 时：
+      Red  = 高分值 = score > 0 = cos(contrib, w_GT) > cos(contrib, w_Pred) = 帮助GT = 好头
+      Blue = 低分值 = score < 0 = 帮助Pred = 坏头
     """
     plt = _setup_plt()
     os.makedirs(output_dir, exist_ok=True)
@@ -483,8 +513,9 @@ def plot_head_heatmap(
 
     ax.set_xlabel("Head Index")
     ax.set_ylabel("Layer Index")
+    # [FIX Bug 2] 修正颜色标签：RdBu_r → Red=高=好头, Blue=低=坏头
     ax.set_title(f"{model_name}: Attention Head GT-Pred Alignment Score\n"
-                 f"(Red = helps Pred/bad, Blue = helps GT/good)")
+                 f"(Red = helps GT/good, Blue = helps Pred/bad)")
 
     # 标注关键数值
     for i in range(num_layers):
@@ -666,9 +697,13 @@ def run_analysis(
     print(f"  Option token IDs: {option_token_ids}")
 
     # ---- 创建hook extractor ----
-    # 分析所有层（但可视化会区分浅层/深层）
     layers_to_hook = list(range(num_layers))
     extractor = PerHeadContributionExtractor(model, device)
+
+    # [FIX Bug 1] 预先收集每层独立的o_proj权重（只读一次GPU显存，移到CPU缓存）
+    print(f"  Collecting per-layer o_proj weights...")
+    per_layer_o_proj_weights = collect_per_layer_o_proj_weights(model, layers_to_hook)
+    print(f"    Collected {len(per_layer_o_proj_weights)} layer o_proj weights")
 
     # ---- 逐样本分析 ----
     all_sample_results = []
@@ -691,6 +726,7 @@ def run_analysis(
                 model=model,
                 tokenizer=tokenizer,
                 extractor=extractor,
+                per_layer_o_proj_weights=per_layer_o_proj_weights,
                 sample=sample,
                 lm_head_weight=lm_head_weight,
                 option_token_ids=option_token_ids,
@@ -718,11 +754,10 @@ def run_analysis(
 
     if not all_sample_results:
         print("  No results to visualize.")
-        del model, tokenizer
+        del model, tokenizer, lm_head_weight, per_layer_o_proj_weights
         return None
 
     # ---- 聚合统计 ----
-    # 构建聚合矩阵
     score_matrix = np.zeros((num_layers, num_heads))
     count_matrix = np.zeros((num_layers, num_heads))
 
@@ -775,8 +810,20 @@ def run_analysis(
         print(f"    Deep bad mean score: {deep_bad_mean:.6f}")
         print(f"    Shallow bad mean score: {shallow_bad_mean:.6f}")
 
+    if deep_good and shallow_good:
+        deep_good_mean = np.mean([e["avg_score"] for e in deep_good])
+        shallow_good_mean = np.mean([e["avg_score"] for e in shallow_good])
+        print(f"    Deep good mean score: {deep_good_mean:.6f}")
+        print(f"    Shallow good mean score: {shallow_good_mean:.6f}")
+
     print(f"\n  Top 10 Most Destructive Heads:")
     for i, e in enumerate(top_bad[:10]):
+        region = "DEEP" if e["is_deep"] else "shallow"
+        print(f"    #{i+1}: Layer {e['layer']:2d}, Head {e['head']:2d} ({region}) "
+              f"score={e['avg_score']:.6f}")
+
+    print(f"\n  Top 10 Most Helpful Heads:")
+    for i, e in enumerate(top_good[:10]):
         region = "DEEP" if e["is_deep"] else "shallow"
         print(f"    #{i+1}: Layer {e['layer']:2d}, Head {e['head']:2d} ({region}) "
               f"score={e['avg_score']:.6f}")
@@ -798,6 +845,9 @@ def run_analysis(
         "n_bad_total": len([e for e in all_entries if e["avg_score"] < 0]),
         "n_bad_shallow": len(shallow_bad),
         "n_bad_deep": len(deep_bad),
+        "n_good_total": len([e for e in all_entries if e["avg_score"] > 0]),
+        "n_good_shallow": len(shallow_good),
+        "n_good_deep": len(deep_good),
         "top_20_bad_heads": top_bad,
         "top_20_good_heads": top_good,
         "per_layer_mean_score": {str(li): round(float(np.mean(avg_matrix[li])), 6)
@@ -812,7 +862,7 @@ def run_analysis(
     print(f"  Results saved to: {json_path}")
 
     # ---- 释放模型 ----
-    del model, tokenizer, lm_head_weight
+    del model, tokenizer, lm_head_weight, per_layer_o_proj_weights
     import gc
     gc.collect()
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -880,6 +930,8 @@ def run_all_models(
         print(f"    Shallow bad head fraction: {findings['shallow_bad_head_fraction']*100:.1f}%")
         if findings["deep_more_destructive"]:
             print(f"    >>> Deep layers are MORE destructive than shallow layers")
+        else:
+            print(f"    >>> Shallow layers are MORE destructive than deep layers")
 
     # 假说检验
     print(f"\n  *** Hypothesis Test: Deep Layer Head Destruction ***")
@@ -887,7 +939,11 @@ def run_all_models(
         print("    >>> STRONG SUPPORT: All models show deep layers have more destructive heads")
     elif any(f["deep_more_destructive"] for f in summary["key_finding"].values()):
         supported = [t for t, f in summary["key_finding"].items() if f["deep_more_destructive"]]
-        print(f"    >>> SUPPORT: {', '.join(supported)} show deep layer head destruction")
+        unsupported = [t for t, f in summary["key_finding"].items() if not f["deep_more_destructive"]]
+        print(f"    >>> MIXED: {', '.join(supported)} show deep layer head destruction")
+        print(f"             {', '.join(unsupported)} do NOT show deep layer head destruction")
+    else:
+        print("    >>> NO SUPPORT: None of the models show deep layer head destruction")
 
     return summary
 
@@ -918,7 +974,7 @@ def main():
     print("=" * 80)
     print("Step 6c: Attention Head Ablation Analysis")
     print("  Identifies which attention heads help GT vs help Pred")
-    print("  Method: per-head contribution decomposition via o_proj")
+    print("  Method: per-head contribution decomposition via per-layer o_proj weights")
     print("  Key question: are deep-layer heads more 'destructive'?")
     print("=" * 80)
 
