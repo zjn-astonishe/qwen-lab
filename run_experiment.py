@@ -1,10 +1,10 @@
 """
-Main Experiment Runner (V7 — with causal proof pipeline)
+Main Experiment Runner (V8 — with attention head ablation)
 
 Orchestrates the entire experimental pipeline.
 
-V7 changes:
-  - Added 3 causal-proof steps: 4b (Logit Cluster), 6b (Feature Distance), 7b (Cross-Model Decode)
+V8 changes:
+  - Added step 6c: Attention Head Ablation Analysis (per-head contribution decomposition)
   - Pipeline order:
       1.  Data Preparation
       2.  Model Inference
@@ -14,13 +14,13 @@ V7 changes:
       5.  CKA Analysis
       6.  Decisive Token Analysis
       6b. Feature Cosine Distance           ← Phase II causal proof
+      6c. Attention Head Ablation          ← Phase II supplementary
       7.  Projection Matrix Training
       7b. Cross-Model LM Head Decoding      ← Phase III causal proof
       8.  Injection Experiments
       9.  Visualization
       10. Summary Report
-  - Steps 3-6b: analysis group; Steps 7-7b: intervention group; Steps 8-10: output group
-  - New steps consume step2 .pt outputs, zero additional inference cost
+  - Steps 3-6c: analysis group; Steps 7-7b: intervention group; Steps 8-10: output group
 """
 
 import os
@@ -70,6 +70,7 @@ STEP_NAMES = {
     5:   "CKA Analysis",
     6:   "Decisive Token Analysis",
     "6b": "Feature Cosine Distance (Phase II)",
+    "6c": "Attention Head Ablation Analysis",
     7:   "Projection Matrix Training",
     "7b": "Cross-Model LM Head Decoding (Phase III)",
     8:   "Injection Experiments",
@@ -79,7 +80,7 @@ STEP_NAMES = {
 
 # Execution order: defines the canonical run sequence
 PIPELINE_ORDER = [
-    1, 2, 3, 4, "4b", 5, 6, "6b", 7, "7b", 8, 9, 10,
+    1, 2, 3, 4, "4b", 5, 6, "6b", "6c", 7, "7b", 8, 9, 10,
 ]
 
 
@@ -97,6 +98,8 @@ Examples:
   python run_experiment.py --steps 4 --probing_models qwen1.5B qwen7B
   python run_experiment.py --steps 6 --decisive_model qwen7B
   python run_experiment.py --steps 6 --decisive_model qwen3B --entropy_threshold 3.0
+  python run_experiment.py --steps 6c --model qwen1.5B
+  python run_experiment.py --steps 6c --model all
         """,
     )
 
@@ -210,6 +213,12 @@ Examples:
                    "--num_samples", str(args.total_samples),
                    "--device", args.device]
             success = run_command(cmd, f"Step 6b: {STEP_NAMES['6b']}")
+
+        elif step == "6c":
+            cmd = [sys.executable, "step6c_attention_head_analysis.py",
+                   "--num_samples", str(args.total_samples),
+                   "--device", args.device]
+            success = run_command(cmd, f"Step 6c: {STEP_NAMES['6c']}")
 
         elif step == "7b":
             cmd = [sys.executable, "step7b_cross_model_decode.py",
