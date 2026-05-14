@@ -340,8 +340,9 @@ def run_analysis(
             h_gen = None
 
             # Try hidden_states_per_step (generation step hidden states)
+            # Use step 0 (answer generation step) to match step7 training data
             if hs_per_step:
-                answer_step = len(hs_per_step) - 1  # Last generation step
+                answer_step = 0  # Answer generation step (matches step7 projection training)
                 step_data = hs_per_step[answer_step]
 
                 # step_data is list[num_layers] of [hidden_dim] or tensor [num_layers, hidden_dim]
